@@ -119,11 +119,19 @@ func Load(dir string) (*RuleSet, error) {
 		return nil, fmt.Errorf("解析 web 规则: %w", err)
 	}
 
-	svcPath := filepath.Join(dir, "service_fingerprint_v4.json")
-	if b, err := os.ReadFile(svcPath); err == nil {
-		if err := json.Unmarshal(b, &rs.Service); err != nil {
-			return nil, fmt.Errorf("解析 service 规则: %w", err)
+	// service 规则：支持单文件或分片（service_fingerprint_v4.part00.json ...）
+	svcFiles, _ := filepath.Glob(filepath.Join(dir, "service_fingerprint_v4*.json"))
+	sort.Strings(svcFiles)
+	for _, svcPath := range svcFiles {
+		b, err := os.ReadFile(svcPath)
+		if err != nil {
+			continue
 		}
+		var chunk []SvcRule
+		if err := json.Unmarshal(b, &chunk); err != nil {
+			return nil, fmt.Errorf("解析 service 规则 %s: %w", filepath.Base(svcPath), err)
+		}
+		rs.Service = append(rs.Service, chunk...)
 	}
 
 	// 预处理：取名称/产品，收集 word pattern 建 AC
