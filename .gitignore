@@ -1,0 +1,26 @@
+# 构建产物
+cyberlook-scan
+cyberlook-scan.exe
+*.exe
+*.test
+/dist/
+
+# 运行数据
+data/eval/
+*.log
+*.tmp
+
+# 环境与密钥
+.env
+*.lic
+*.key
+*.pem
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 操作系统
+.DS_Store
+Thumbs.db
