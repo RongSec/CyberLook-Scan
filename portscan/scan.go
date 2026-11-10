@@ -26,7 +26,7 @@ type Options struct {
 	Concurrency int           // 并发连接数，默认 4096
 	Timeout     time.Duration // 单端口超时，默认 500ms
 	// OnProgress 每完成一批回调（done=已完成探针数，total=总探针数，open=已发现开放数）
-	OnProgress func(done, total int64, open int64)
+	OnProgress    func(done, total int64, open int64)
 	ProgressEvery time.Duration // 进度回调间隔，默认 2s
 }
 
