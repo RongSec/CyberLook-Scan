@@ -1,6 +1,6 @@
-# 构建产物
-cyberlook-scan
-cyberlook-scan.exe
+# 构建产物（必须加根锚定 `/`：无斜杠的 cyberlook-scan 会连带忽略 cmd/cyberlook-scan/ 整个源码目录）
+/cyberlook-scan
+/cyberlook-scan.exe
 *.exe
 *.test
 /dist/
