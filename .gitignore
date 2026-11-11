@@ -24,3 +24,6 @@ data/eval/
 # 操作系统
 .DS_Store
 Thumbs.db
+
+# 出包产物
+dist/
