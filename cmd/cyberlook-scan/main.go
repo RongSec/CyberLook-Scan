@@ -25,7 +25,7 @@ import (
 	"github.com/RongSec/CyberLook-Scan/svcid"
 )
 
-const version = "1.1.0"
+const version = "1.1.1"
 
 const banner = `
    ____                          __  __
