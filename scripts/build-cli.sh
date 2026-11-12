@@ -10,8 +10,12 @@
 # 用法：
 #   bash scripts/build-cli.sh     # 本机有 go 用本机；否则自动用 docker golang:1.26-alpine
 set -euo pipefail
-# Git Bash 下 docker.exe 参数 "/src" 会被 MSYS 路径换算破坏；关闭换算。
-export MSYS2_ARG_CONV_EXCL='*'
+# 注意：**不要**在这里全局 export MSYS2_ARG_CONV_EXCL。
+#   - docker 分支需要它（否则 "/src" 被 MSYS 换算成宿主机盘符路径）；
+#   - 但 native 分支绝对不能开：开了之后 `go build -o /d/repo/dist/...` 会把
+#     POSIX 路径原样交给 Windows 的 go.exe，产物直接落到 D://d//repo//dist//...
+#     而 dist/ 目录看起来是空的（v1.2.1 出包时踩过，找半天）。
+# 所以只在 docker run 那一行前面加前缀。
 cd "$(dirname "$0")/.."
 REPO="$(pwd)"
 
@@ -49,7 +53,7 @@ elif command -v docker >/dev/null 2>&1; then
   case "$src" in
     /?/*) src="$(printf '%s' "${src:1:1}" | tr 'a-z' 'A-Z'):${src:2}" ;;
   esac
-  docker run --rm --platform linux/amd64 \
+  MSYS2_ARG_CONV_EXCL='*' docker run --rm --platform linux/amd64 \
     -v "$src:/src" \
     -v gocache-clsbuild:/root/.cache/go-build \
     -v gomod-clsbuild:/go/pkg/mod \

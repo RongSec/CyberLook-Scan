@@ -12,6 +12,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -25,7 +26,7 @@ import (
 	"github.com/RongSec/CyberLook-Scan/svcid"
 )
 
-const version = "1.2.0"
+const version = "1.2.1"
 
 const banner = `
    ____                          __  __
@@ -322,6 +323,11 @@ func main() {
 			}
 		},
 	})
+	if err != nil && errors.Is(err, portscan.ErrLocalResourceExhausted) {
+		// 本机 fd/端口不足：结果不可信，必须非 0 退出，别让调用方当成"没有开放端口"
+		fmt.Println("[错误] 本机 fd/端口资源不足，结果不可信（请调大 nofile 或调小并发）:", err)
+		os.Exit(3)
+	}
 	if err != nil && len(opens) == 0 {
 		fmt.Println("[错误] 扫描失败:", err)
 		os.Exit(1)
@@ -349,6 +355,10 @@ func main() {
 	}
 	fmt.Printf("探针 %d，用时 %s，速率 %.0f 探针/秒\n", st.Probes, st.Elapsed.Round(time.Second), st.PPS())
 	fmt.Printf("开放 %d，关闭 %d（RST），过滤/超时 %d，错误 %d\n", st.Open, st.Closed, st.Filtered, st.Errors)
+	if st.LocalResErrs > 0 {
+		// 本地 fd/端口不够导致的未发探针：结果可能不完整，必须显式告警
+		fmt.Printf("⚠️ 本地 fd/端口不足 %d 次（结果可能漏报，请调大 nofile 或调小并发）\n", st.LocalResErrs)
+	}
 	if !*quiet {
 		fmt.Printf("开放端口：%v\n", out.OpenPorts)
 	}
