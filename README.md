@@ -7,6 +7,22 @@
 - **吞吐靠并发**：4096 并发 × 500ms ≈ 8000 探针/秒。关闭端口立刻回 RST，不受超时拖累。
 - **全量规则**：内置 [0x727/FingerprintHub](https://github.com/0x727/FingerprintHub)（MIT）web 3450 条 + service 11938 条，Aho-Corasick 一次扫描完成 word 匹配。
 
+
+## 这个模块也被平台依赖（改动须知）
+
+平台 `CyberLook` **不再复制** `portscan` / `svcid` 源码，而是 `require` 本模块的 tag。
+也就是说这里改一行，平台和你自己编的 CLI 会同时生效 —— 功能与性能天然一致，
+代价是这里必须遵守两条约束：
+
+1. **保持 API 稳定**：`portscan.Options/Result/Stats/Controls/ParsePorts/ErrLocalResourceExhausted`、
+   `svcid.RuleSet/Load/BuildServiceProbes/...` 的签名与语义不要随意改（要改就发 major 版本）。
+2. **每次改动都要打 tag**：`git tag -a vX.Y.Z && git push origin main --tags`，
+   然后在平台里 `go get github.com/RongSec/CyberLook-Scan@vX.Y.Z && go mod tidy`。
+   平台侧有 `scripts/check-engine-version.sh` 会比对锁定版本与最新 tag，漂了会报出来。
+
+只改文档/CI 不必打 tag；改了扫描逻辑、指纹识别、存活探测就必须打。
+
+
 ## 构建
 
 需要 Go 1.26+：
