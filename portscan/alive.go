@@ -77,7 +77,13 @@ type AliveOptions struct {
 	Concurrency int           // 并发主机数；0 = 512
 	TCPTimeout  time.Duration // 单端口超时；0 = 400ms
 	ICMP        bool          // 是否启用 ICMP 阶段（无权限时自动跳过，不报错）
-	// OnProgress 进度回调（done=已处理主机数，alive=当前存活数）；返回 false 中止。
+	// SkipTCPIfAlive 被 ICMP 判活的主机不再跑 TCP。
+	// 只关心"活着/没活着"的调用方（平台）打开它，能省掉一轮无用探针；
+	// 需要 OpenPorts 真值的调用方（CLI）必须关闭，否则端口列表是空的。
+	SkipTCPIfAlive bool
+	// OnProgress 进度回调（done=已处理主机数，alive=当前存活数，均为 0..Hosts 内单调递增）；
+	// 返回 false 中止探测。回调会被节流（约每 0.7s 一次 + 每个 ICMP 批次一次），
+	// 可以直接在里面写库/推 SSE。
 	OnProgress func(done, alive int) bool
 }
 
@@ -140,19 +146,59 @@ func DiscoverHosts(ctx context.Context, ips []string, opt AliveOptions) ([]Alive
 		return nil, st
 	}
 	start := time.Now()
+	n := len(ips)
+
+	// ── 进度：ICMP 与 TCP 各算一遍"主机数"，归一化到 0..n，各占一半 ──
+	// 两遍都处理全部主机，进度条从 0 走到 n（50% 处进 TCP 阶段）。
+	// 为什么这样归一化：ICMP 阶段也可能占掉可观时间（大网段几万 IP），
+	// 如果第二遍才从 0 开始数，进度条会先到 100% 再跳回 0；
+	// 反过来只报 ICMP 阶段的原始台数，进度会在 50% 之前一直贴着 0。
+	var icmpDone, tcpDone, aliveNum int64
+	report := func() bool {
+		d := (int(atomic.LoadInt64(&icmpDone)) + int(atomic.LoadInt64(&tcpDone))) / 2
+		if d > n {
+			d = n
+		}
+		a := int(atomic.LoadInt64(&aliveNum))
+		if a > n {
+			a = n
+		}
+		return onProgress(d, a)
+	}
 
 	// ===== 阶段 1：ICMP =====
 	icmpAlive := map[string]bool{}
 	unreach := map[string]bool{}
 	icmpSkip := true
 	if opt.ICMP {
-		icmpAlive, unreach, icmpSkip = icmpSweep(ctx, ips)
+		icmpAlive, unreach, icmpSkip = icmpSweep(ctx, ips, func(done, alive int) bool {
+			atomic.StoreInt64(&icmpDone, int64(done))
+			atomic.StoreInt64(&aliveNum, int64(alive))
+			return report()
+		})
+	}
+	atomic.StoreInt64(&icmpDone, int64(n))
+	if icmpSkip {
+		// ICMP 不可用（无权限/平台不支持）：整段算 0 成本，进度由 TCP 阶段一肩挑
+		atomic.StoreInt64(&icmpDone, int64(n))
 	}
 
-	// ===== 阶段 2：TCP（跳过 ICMP 明确不可达的）=====
+	// ===== 阶段 2：TCP（跳过 ICMP 明确不可达的；可选跳过 ICMP 已判活的）=====
+	skip := unreach
+	if opt.SkipTCPIfAlive {
+		skip = make(map[string]bool, len(unreach)+len(icmpAlive))
+		for ip := range unreach {
+			skip[ip] = true
+		}
+		for ip := range icmpAlive {
+			skip[ip] = true
+		}
+		// 这些主机已经处理完了，先记进第二遍的完成数，进度才不会原地不动
+		atomic.StoreInt64(&tcpDone, int64(len(icmpAlive)))
+	}
 	targets := make([]string, 0, len(ips))
 	for _, ip := range ips {
-		if unreach[ip] {
+		if skip[ip] {
 			continue
 		}
 		targets = append(targets, ip)
@@ -163,8 +209,20 @@ func DiscoverHosts(ctx context.Context, ips []string, opt AliveOptions) ([]Alive
 		port  int
 	}
 	tcpAlive := make([]int32, len(targets))
+	// finished 保证每台主机在进度里只计一次（判活与"端口探完"是两条路径）
+	finished := make([]int32, len(targets))
+	remaining := make([]int32, len(targets))
+	for i := range targets {
+		remaining[i] = int32(len(ports))
+	}
 	hits := make([]aliveHit, len(targets))
 	var probes, skipped int64
+
+	finishHost := func(i int) {
+		if atomic.CompareAndSwapInt32(&finished[i], 0, 1) {
+			atomic.AddInt64(&tcpDone, 1)
+		}
+	}
 
 	jobs := make(chan job, minInt(concurrency*2, 8192))
 	var wg sync.WaitGroup
@@ -187,22 +245,49 @@ func DiscoverHosts(ctx context.Context, ips []string, opt AliveOptions) ([]Alive
 				}
 				conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(targets[j.ipIdx], strconv.Itoa(j.port)))
 				atomic.AddInt64(&probes, 1)
-				if err != nil {
+				if err == nil {
+					_ = conn.Close()
+					hits[j.ipIdx].add(j.port)
+					atomic.StoreInt32(&tcpAlive[j.ipIdx], 1)
+					atomic.AddInt64(&aliveNum, 1)
+					finishHost(j.ipIdx)
 					continue
 				}
-				_ = conn.Close()
-				hits[j.ipIdx].add(j.port)
-				atomic.StoreInt32(&tcpAlive[j.ipIdx], 1)
+				if atomic.AddInt32(&remaining[j.ipIdx], -1) == 0 {
+					finishHost(j.ipIdx)
+				}
 			}
 		}()
 	}
 
+	// 周期上报：TCP 阶段是主要耗时，没有它界面就只有"探测中"三个字
+	repCtx, stopRep := context.WithCancel(ctx)
+	defer stopRep()
+	repDone := make(chan struct{})
+	go func() {
+		defer close(repDone)
+		t := time.NewTicker(700 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-repCtx.Done():
+				return
+			case <-t.C:
+				if !report() {
+					stopRep()
+					return
+				}
+			}
+		}
+	}()
+
 dispatch:
 	for i := range targets {
-		for _, port := range ports {
+		for pi, port := range ports {
 			if atomic.LoadInt32(&tcpAlive[i]) == 1 {
-				atomic.AddInt64(&skipped, 1)
-				continue
+				// 这台已判活：剩下的端口一个都不用发，全部记入跳过（统计要能算平）
+				atomic.AddInt64(&skipped, int64(len(ports)-pi))
+				break
 			}
 			select {
 			case jobs <- job{ipIdx: i, port: port}:
@@ -213,25 +298,23 @@ dispatch:
 	}
 	close(jobs)
 	wg.Wait()
+	stopRep()
+	<-repDone
 
 	// ===== 合并：ICMP 或 TCP 任一判活即存活 =====
-	tcpAliveSet := make(map[string]bool, len(targets)/4)
+	aliveIdx := make(map[string]int, len(targets))
 	for i, ip := range targets {
-		if atomic.LoadInt32(&tcpAlive[i]) == 1 {
-			tcpAliveSet[ip] = true
-		}
+		aliveIdx[ip] = i
 	}
 	out := make([]AliveHost, 0, len(ips)/4)
 	for _, ip := range ips {
-		if icmpAlive[ip] || tcpAliveSet[ip] {
+		_, byTCP := aliveIdx[ip]
+		byTCP = byTCP && atomic.LoadInt32(&tcpAlive[aliveIdx[ip]]) == 1
+		if icmpAlive[ip] || byTCP {
 			ps := []int{}
-			for i, t := range targets {
-				if t == ip {
-					ps = hits[i].sorted()
-					if ps == nil {
-						ps = []int{}
-					}
-					break
+			if byTCP {
+				if v := hits[aliveIdx[ip]].sorted(); v != nil {
+					ps = v
 				}
 			}
 			out = append(out, AliveHost{IP: ip, OpenPorts: ps})
@@ -243,22 +326,32 @@ dispatch:
 	st.Skipped = atomic.LoadInt64(&skipped)
 	st.Alive = len(out)
 	st.ByICMP = countTrue(icmpAlive, ips)
-	st.ByTCP = len(tcpAliveSet)
+	for _, ip := range targets {
+		if atomic.LoadInt32(&tcpAlive[aliveIdx[ip]]) == 1 {
+			st.ByTCP++
+		}
+	}
 	st.Unreach = len(unreach)
 	st.ICMPSkip = icmpSkip
 	st.Elapsed = time.Since(start)
-	if len(out) > 0 || st.Hosts > 0 {
-		onProgress(st.Hosts-len(unreach), len(out))
-	}
+
+	// 收尾：把进度顶到 100%（前面按两遍各半归一化，末尾补齐误差）
+	atomic.StoreInt64(&icmpDone, int64(n))
+	atomic.StoreInt64(&tcpDone, int64(n))
+	atomic.StoreInt64(&aliveNum, int64(len(out)))
+	_ = report()
 	return out, st
 }
 
 // ===== ICMP 阶段 =====
 
 // icmpSweep 批量发 Echo 并收集回包。返回 (存活, 明确不可达, 是否跳过)。
-// 一个 socket 发全部、一个 goroutine 收全部，按源 IP 归集 —— 不做逐 IP 同步等待
-// （那样 9 万个 IP 就要等 9 万次超时）。ICMP 不可用时返回 (nil,nil,true) 退化为纯 TCP。
-func icmpSweep(ctx context.Context, ips []string) (map[string]bool, map[string]bool, bool) {
+// onBatch(已处理台数, 存活台数) 每批回调一次，返回 false 中止。
+//
+// 实现：一个 socket 发全部、一个 goroutine 收全部，按源 IP 归集 ——
+// 不做逐 IP 同步等待（那样 9 万个 IP 就要等 9 万次超时）。
+// ICMP 不可用（无权限/平台不支持）时返回 (nil,nil,true)，退化为纯 TCP。
+func icmpSweep(ctx context.Context, ips []string, onBatch func(done, alive int) bool) (map[string]bool, map[string]bool, bool) {
 	conn, err := icmp.ListenPacket("udp4", "0.0.0.0")
 	if err != nil {
 		return nil, nil, true
@@ -328,6 +421,12 @@ func icmpSweep(ctx context.Context, ips []string) (map[string]bool, map[string]b
 		}
 		if i%aliveICMPBatch == aliveICMPBatch-1 {
 			time.Sleep(10 * time.Millisecond)
+			mu.Lock()
+			done, hit := i+1, len(alive)
+			mu.Unlock()
+			if !onBatch(done, hit) {
+				break // 调用方要求中止：停止发包，已发的等回包
+			}
 		}
 	}
 

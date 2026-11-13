@@ -3,6 +3,7 @@ package portscan
 import (
 	"context"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -166,4 +167,67 @@ func TestAliveProbeMultiIP(t *testing.T) {
 		t.Errorf("耗时上限超标: %s", st.Elapsed)
 	}
 	t.Logf("多 IP 存活: %+v", hosts)
+}
+
+// TestAliveProbeProgressMonotonic 进度必须单调递增且能走到 100%
+// —— 平台界面的"存活探测 30%/65536"直接吃这个回调，回退或卡住都是用户可见的 bug。
+func TestAliveProbeProgressMonotonic(t *testing.T) {
+	port := listenLocal(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	ips := []string{"127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.4"}
+	var mu sync.Mutex
+	var samples [][2]int
+	_, st := DiscoverHosts(ctx, ips, AliveOptions{
+		Ports: []int{port, 60021, 60022}, Concurrency: 4,
+		TCPTimeout: 200 * time.Millisecond, ICMP: true,
+		OnProgress: func(done, alive int) bool {
+			mu.Lock()
+			samples = append(samples, [2]int{done, alive})
+			mu.Unlock()
+			return true
+		},
+	})
+	if len(samples) == 0 {
+		t.Fatal("进度回调一次都没触发")
+	}
+	last := -1
+	for _, s := range samples {
+		if s[0] < last {
+			t.Fatalf("进度回退：%d → %d（样本 %v）", last, s[0], samples)
+		}
+		last = s[0]
+		if s[0] > len(ips) || s[1] > len(ips) {
+			t.Fatalf("进度越界：%v（主机数 %d）", s, len(ips))
+		}
+	}
+	if final := samples[len(samples)-1][0]; final != len(ips) {
+		t.Errorf("最终进度应等于主机数，得到 %d/%d", final, len(ips))
+	}
+	t.Logf("进度样本 %d 个，末值 %v，统计 %+v", len(samples), samples[len(samples)-1], st)
+}
+
+// TestAliveProbeSkipTCPIfAlive 打开 SkipTCPIfAlive 后仍要判出存活，只是不带端口真值
+func TestAliveProbeSkipTCPIfAlive(t *testing.T) {
+	port := listenLocal(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	hosts, st := DiscoverHosts(ctx, []string{"127.0.0.1"}, AliveOptions{
+		Ports: []int{port}, Concurrency: 2, TCPTimeout: 200 * time.Millisecond,
+		ICMP: true, SkipTCPIfAlive: true,
+	})
+	if len(hosts) != 1 || hosts[0].IP != "127.0.0.1" {
+		t.Fatalf("127.0.0.1 应判为存活: %+v", hosts)
+	}
+	if st.ICMPSkip {
+		t.Skip("本机 ICMP 不可用（无 ping 权限），跳过端口断言")
+	}
+	if len(hosts[0].OpenPorts) != 0 {
+		t.Errorf("SkipTCPIfAlive 不应再跑 TCP，却在 %v 上拿到了端口 %v", hosts[0].IP, hosts[0].OpenPorts)
+	}
+	if st.Probes != 0 {
+		t.Errorf("SkipTCPIfAlive 下不应发出 TCP 探针，实际 %d", st.Probes)
+	}
 }
