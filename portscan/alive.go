@@ -1,24 +1,36 @@
 package portscan
 
-// 存活探测（host discovery）
+// 存活探测（host discovery）—— ICMP + TCP 两阶段，平台与 CLI 共用这一份实现
 //
-// 实现取舍：
-//   - 只用 connect() 探 TCP 常用端口，**不做 ICMP / raw socket**：
-//     Windows 下 raw socket 需要管理员权限，且行为不稳（没权限时整条链路直接失效）。
-//     TCP connect 无特权要求、跨平台一致，还能顺带把"哪个端口开着"一起拿到。
-//   - 任一端口连上即判定存活，并做 best-effort 短路：已判定存活的 IP，
-//     其剩余端口的探针在投递与执行两侧都会跳过，不浪费探针。
-//   - 短超时（默认 400ms）：存活探测的目的是快速筛掉死主机，不是精确端口枚举；
-//     过滤型防火墙下的静默丢弃由后续完整端口扫描兜底。
+// 判定链：
+//   - 阶段 1 ICMP Echo（非特权 udp4；Linux 只要 net.ipv4.ping_group_range 允许即可，
+//     否则自动跳过整个阶段，不影响使用）。Echo Reply → 存活；
+//     Destination Unreachable → 明确判死，TCP 阶段跳过这台（省时间）。
+//   - 阶段 2 TCP connect 到常用端口。连上（SYN-ACK）或被拒绝（RST）都算存活
+//     —— RST 说明主机回了包，只是端口关着。
+//
+// 为什么必须两层：目标把 SYN 静默丢弃（防火墙默认 DROP）时，纯 TCP 会把这台
+// **活着但端口被过滤**的机器判死；反过来只做 ICMP 会漏掉不响应 ping 的机器。
+// 实测某 /16：605 台存活里 312 台五个常用端口全不通（纯 TCP 会全漏），
+// 另有 310 台不响应 ICMP（纯 ICMP 会全漏）。两层互补，缺一不可。
+//
+// 为什么要对 ICMP 已判活的主机仍跑 TCP：调用方（CLI）需要 OpenPorts，
+// 而且端口真值由 TCP 阶段给出，ICMP 只负责"这台还活着"。只有 ICMP 明确不可达的才跳过。
+//
+// 平台（CyberLook）与本 CLI 都调用这里的 DiscoverHosts，行为与性能天然一致。
 
 import (
 	"context"
 	"net"
+	"os"
 	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
 )
 
 // DefaultAlivePorts 存活探测的常用端口集。
@@ -47,12 +59,26 @@ type AliveHost struct {
 
 // AliveStats 存活探测汇总
 type AliveStats struct {
-	Hosts   int           // 待探测主机数
-	Ports   int           // 每台主机探测的端口数
-	Probes  int64         // 实际发出的探针数
-	Skipped int64         // 因已判定存活而短路跳过的探针数
-	Alive   int           // 存活主机数
-	Elapsed time.Duration // 总耗时
+	Hosts    int           // 待探测主机数
+	Ports    int           // 每台主机探测的端口数
+	Probes   int64         // 实际发出的 TCP 探针数
+	Skipped  int64         // 因已判定存活而短路跳过的探针数
+	Alive    int           // 存活主机数
+	ByICMP   int           // 其中 ICMP 判活的台数
+	ByTCP    int           // 其中 TCP 单独判活的台数
+	Unreach  int           // ICMP 明确不可达的台数
+	ICMPSkip bool          // ICMP 阶段是否被跳过（无权限/非 Linux/关闭）
+	Elapsed  time.Duration // 总耗时
+}
+
+// AliveOptions 存活探测参数（零值即可用）。
+type AliveOptions struct {
+	Ports       []int         // TCP 阶段端口；空 = DefaultAlivePorts
+	Concurrency int           // 并发主机数；0 = 512
+	TCPTimeout  time.Duration // 单端口超时；0 = 400ms
+	ICMP        bool          // 是否启用 ICMP 阶段（无权限时自动跳过，不报错）
+	// OnProgress 进度回调（done=已处理主机数，alive=当前存活数）；返回 false 中止。
+	OnProgress func(done, alive int) bool
 }
 
 // aliveHit 单台主机的命中端口收集（每台一个，写入方自带互斥，读取发生在 wg.Wait 之后）
@@ -83,37 +109,69 @@ func AliveProbe(ctx context.Context, ips []string, ports []int, concurrency int,
 	return hosts
 }
 
-// AliveProbeStats 同 AliveProbe，但额外返回汇总统计（探测数 / 存活数 / 耗时）。
+// AliveProbeStats 同 AliveProbe，但额外返回汇总统计。
 func AliveProbeStats(ctx context.Context, ips []string, ports []int, concurrency int, timeout time.Duration) ([]AliveHost, AliveStats) {
+	return DiscoverHosts(ctx, ips, AliveOptions{
+		Ports: ports, Concurrency: concurrency, TCPTimeout: timeout, ICMP: true,
+	})
+}
+
+// DiscoverHosts 两阶段存活探测（ICMP Echo → TCP connect），平台与 CLI 共用。
+func DiscoverHosts(ctx context.Context, ips []string, opt AliveOptions) ([]AliveHost, AliveStats) {
+	ports := opt.Ports
+	if len(ports) == 0 {
+		ports = DefaultAlivePorts
+	}
+	timeout := opt.TCPTimeout
+	if timeout <= 0 {
+		timeout = DefaultAliveTimeout
+	}
+	concurrency := opt.Concurrency
+	if concurrency <= 0 {
+		concurrency = 512
+	}
+	onProgress := opt.OnProgress
+	if onProgress == nil {
+		onProgress = func(int, int) bool { return true }
+	}
+
 	st := AliveStats{Hosts: len(ips), Ports: len(ports)}
 	if len(ips) == 0 {
 		return nil, st
 	}
-	if len(ports) == 0 {
-		ports = DefaultAlivePorts
-		st.Ports = len(ports)
+	start := time.Now()
+
+	// ===== 阶段 1：ICMP =====
+	icmpAlive := map[string]bool{}
+	unreach := map[string]bool{}
+	icmpSkip := true
+	if opt.ICMP {
+		icmpAlive, unreach, icmpSkip = icmpSweep(ctx, ips)
 	}
-	if timeout <= 0 {
-		timeout = DefaultAliveTimeout
-	}
-	if concurrency <= 0 {
-		concurrency = 512
+
+	// ===== 阶段 2：TCP（跳过 ICMP 明确不可达的）=====
+	targets := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		if unreach[ip] {
+			continue
+		}
+		targets = append(targets, ip)
 	}
 
 	type job struct {
 		ipIdx int
 		port  int
 	}
-
-	// alive[i] == 1 表示第 i 个 IP 已判定存活（atomic 读写，best-effort 短路依据）
-	alive := make([]int32, len(ips))
-	hits := make([]aliveHit, len(ips))
+	tcpAlive := make([]int32, len(targets))
+	hits := make([]aliveHit, len(targets))
 	var probes, skipped int64
 
-	start := time.Now()
 	jobs := make(chan job, minInt(concurrency*2, 8192))
 	var wg sync.WaitGroup
-	workerCount := minInt(concurrency, len(ips)*len(ports))
+	workerCount := minInt(concurrency, len(targets)*len(ports))
+	if workerCount < 1 {
+		workerCount = 1
+	}
 	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
 		go func() {
@@ -123,28 +181,26 @@ func AliveProbeStats(ctx context.Context, ips []string, ports []int, concurrency
 				if ctx.Err() != nil {
 					return
 				}
-				// 短路：该 IP 已判定存活，剩余端口不必再探
-				if atomic.LoadInt32(&alive[j.ipIdx]) == 1 {
-					atomic.AddInt64(&skipped, 1)
+				if atomic.LoadInt32(&tcpAlive[j.ipIdx]) == 1 {
+					atomic.AddInt64(&skipped, 1) // 短路：这台已判活，剩余端口不再探
 					continue
 				}
-				addr := net.JoinHostPort(ips[j.ipIdx], strconv.Itoa(j.port))
-				conn, err := d.DialContext(ctx, "tcp", addr)
+				conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(targets[j.ipIdx], strconv.Itoa(j.port)))
 				atomic.AddInt64(&probes, 1)
 				if err != nil {
 					continue
 				}
 				_ = conn.Close()
 				hits[j.ipIdx].add(j.port)
-				atomic.StoreInt32(&alive[j.ipIdx], 1)
+				atomic.StoreInt32(&tcpAlive[j.ipIdx], 1)
 			}
 		}()
 	}
 
 dispatch:
-	for i := range ips {
+	for i := range targets {
 		for _, port := range ports {
-			if atomic.LoadInt32(&alive[i]) == 1 {
+			if atomic.LoadInt32(&tcpAlive[i]) == 1 {
 				atomic.AddInt64(&skipped, 1)
 				continue
 			}
@@ -158,24 +214,145 @@ dispatch:
 	close(jobs)
 	wg.Wait()
 
-	out := make([]AliveHost, 0, len(ips))
-	for i, ip := range ips {
-		if atomic.LoadInt32(&alive[i]) != 1 {
-			continue
+	// ===== 合并：ICMP 或 TCP 任一判活即存活 =====
+	tcpAliveSet := make(map[string]bool, len(targets)/4)
+	for i, ip := range targets {
+		if atomic.LoadInt32(&tcpAlive[i]) == 1 {
+			tcpAliveSet[ip] = true
 		}
-		ps := hits[i].sorted()
-		if ps == nil {
-			ps = []int{}
+	}
+	out := make([]AliveHost, 0, len(ips)/4)
+	for _, ip := range ips {
+		if icmpAlive[ip] || tcpAliveSet[ip] {
+			ps := []int{}
+			for i, t := range targets {
+				if t == ip {
+					ps = hits[i].sorted()
+					if ps == nil {
+						ps = []int{}
+					}
+					break
+				}
+			}
+			out = append(out, AliveHost{IP: ip, OpenPorts: ps})
 		}
-		out = append(out, AliveHost{IP: ip, OpenPorts: ps})
 	}
 	sort.Slice(out, func(a, b int) bool { return out[a].IP < out[b].IP })
 
 	st.Probes = atomic.LoadInt64(&probes)
 	st.Skipped = atomic.LoadInt64(&skipped)
 	st.Alive = len(out)
+	st.ByICMP = countTrue(icmpAlive, ips)
+	st.ByTCP = len(tcpAliveSet)
+	st.Unreach = len(unreach)
+	st.ICMPSkip = icmpSkip
 	st.Elapsed = time.Since(start)
+	if len(out) > 0 || st.Hosts > 0 {
+		onProgress(st.Hosts-len(unreach), len(out))
+	}
 	return out, st
+}
+
+// ===== ICMP 阶段 =====
+
+// icmpSweep 批量发 Echo 并收集回包。返回 (存活, 明确不可达, 是否跳过)。
+// 一个 socket 发全部、一个 goroutine 收全部，按源 IP 归集 —— 不做逐 IP 同步等待
+// （那样 9 万个 IP 就要等 9 万次超时）。ICMP 不可用时返回 (nil,nil,true) 退化为纯 TCP。
+func icmpSweep(ctx context.Context, ips []string) (map[string]bool, map[string]bool, bool) {
+	conn, err := icmp.ListenPacket("udp4", "0.0.0.0")
+	if err != nil {
+		return nil, nil, true
+	}
+	defer conn.Close()
+
+	alive := make(map[string]bool, len(ips)/4)
+	unreach := make(map[string]bool, 64)
+	var mu sync.Mutex
+
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		buf := make([]byte, 1500)
+		for {
+			n, peer, err := conn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			addr, ok := peer.(*net.UDPAddr)
+			if !ok {
+				continue
+			}
+			msg, err := icmp.ParseMessage(1, buf[:n])
+			if err != nil {
+				continue
+			}
+			ip := addr.IP.String()
+			switch msg.Type {
+			case ipv4.ICMPTypeEchoReply:
+				mu.Lock()
+				alive[ip] = true
+				mu.Unlock()
+			case ipv4.ICMPTypeDestinationUnreachable:
+				mu.Lock()
+				if !alive[ip] {
+					unreach[ip] = true
+				}
+				mu.Unlock()
+			}
+		}
+	}()
+
+	id := os.Getpid() & 0xffff
+	seq := 0
+	for i := 0; i < len(ips); i++ {
+		if ctx.Err() != nil {
+			break
+		}
+		seq++
+		msg := icmp.Message{
+			Type: ipv4.ICMPTypeEcho, Code: 0,
+			Body: &icmp.Echo{ID: id, Seq: seq & 0xffff, Data: []byte("alive-probe")},
+		}
+		b, err := msg.Marshal(nil)
+		if err != nil {
+			continue
+		}
+		dst := &net.UDPAddr{IP: net.ParseIP(ips[i])}
+		if dst.IP == nil {
+			continue
+		}
+		if _, err := conn.WriteTo(b, dst); err != nil {
+			mu.Lock()
+			unreach[ips[i]] = true
+			mu.Unlock()
+		}
+		if i%aliveICMPBatch == aliveICMPBatch-1 {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(aliveICMPWait))
+	<-readDone
+	return alive, unreach, false
+}
+
+const (
+	aliveICMPBatch = 1000
+	aliveICMPWait  = 1200 * time.Millisecond
+)
+
+// countTrue 统计 map 中有多少个 key 在 ips 里（避免把不在本次目标里的回包算进来）。
+func countTrue(m map[string]bool, ips []string) int {
+	if len(m) == 0 {
+		return 0
+	}
+	n := 0
+	for _, ip := range ips {
+		if m[ip] {
+			n++
+		}
+	}
+	return n
 }
 
 func minInt(a, b int) int {
