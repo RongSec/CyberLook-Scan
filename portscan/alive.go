@@ -218,9 +218,16 @@ func DiscoverHosts(ctx context.Context, ips []string, opt AliveOptions) ([]Alive
 	hits := make([]aliveHit, len(targets))
 	var probes, skipped int64
 
-	finishHost := func(i int) {
+	// finishHost 每台主机只认第一次：CAS 失败说明已经计过数了。
+	// aliveNum 的累加必须挂在这个闸门上 —— 两个端口并发连通同一台主机时，
+	// 各自都会走到"判活"分支，不设闸门就会把这台机器算两次
+	// （实测 /16 上进度里报 1703 台存活，实际只有 977 台）。
+	finishHost := func(i int, alive bool) {
 		if atomic.CompareAndSwapInt32(&finished[i], 0, 1) {
 			atomic.AddInt64(&tcpDone, 1)
+			if alive {
+				atomic.AddInt64(&aliveNum, 1)
+			}
 		}
 	}
 
@@ -249,12 +256,11 @@ func DiscoverHosts(ctx context.Context, ips []string, opt AliveOptions) ([]Alive
 					_ = conn.Close()
 					hits[j.ipIdx].add(j.port)
 					atomic.StoreInt32(&tcpAlive[j.ipIdx], 1)
-					atomic.AddInt64(&aliveNum, 1)
-					finishHost(j.ipIdx)
+					finishHost(j.ipIdx, true)
 					continue
 				}
 				if atomic.AddInt32(&remaining[j.ipIdx], -1) == 0 {
-					finishHost(j.ipIdx)
+					finishHost(j.ipIdx, false)
 				}
 			}
 		}()
