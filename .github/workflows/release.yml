@@ -1,0 +1,180 @@
+name: build-and-release
+
+# 触发方式：
+#   1) push main        → 只跑测试 + 编译 5 平台（验证没编坏，不发布）
+#   2) push v* 标签     → 测试 + 编译 + 发布 Release（5 个产物 + sha256）
+#   3) 手动 workflow_dispatch → 同上但不发布，产物在 Actions 页面下载
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write # 发布 Release 需要写权限
+
+env:
+  # 国内网络下 goproxy.cn 更快；GitHub Runner 直连 proxy.golang.org 也通，留 ecosystem 兼容
+  GR_GOFLAGS: -buildvcs=false
+
+jobs:
+  # ── 1. 单元测试：跑不通就不要出包 ───────────────────────────────
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: 依赖下载
+        run: go mod download
+
+      - name: go vet
+        run: go vet ./...
+
+      # 关键用例单独点名跑一遍，让 Actions 日志里能一眼看到
+      # （fd 耗尽假阴性、限速器、存活探测、指纹规则加载）
+      - name: 关键单测（资源耗尽 / 限速器）
+        run: go test ./portscan/ -run 'LocalResource|Emfile|Mixed|Limit|Pause|Resume' -v
+
+      - name: 全量单测
+        run: go test ./... -count=1
+
+  # ── 2. 多平台编译：5 个目标，纯 Go 无 CGO（麒麟/龙芯/老发行版直接可用）──
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.suffix }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # linux amd64        —— 服务器 / 常规 Linux
+          - { goos: linux,   goarch: amd64,  suffix: '' }
+          # linux arm64        —— ARM 服务器、飞腾/鲲鹏
+          - { goos: linux,   goarch: arm64,  suffix: '' }
+          # linux 386          —— 32 位老系统
+          - { goos: linux,   goarch: '386',  suffix: '' }
+          # linux mipsle       —— 龙芯 / 部分麒麟，必须软浮点
+          - { goos: linux,   goarch: mipsle, suffix: '-softfloat', gomips: softfloat }
+          # windows amd64      —— 办公网 Windows 节点
+          - { goos: windows, goarch: amd64,  suffix: '' }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: 解析版本号
+        id: ver
+        run: |
+          # 版本号以源码里的 const version 为准（tag 与它不一致时以源码为真相）
+          V=$(sed -n 's/^const version = "\(.*\)"/\1/p' cmd/cyberlook-scan/main.go)
+          [ -n "$V" ] || { echo "无法从 cmd/cyberlook-scan/main.go 解析 const version"; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "版本号: $V"
+
+      - name: 编译
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOMIPS: ${{ matrix.gomips }}
+          CGO_ENABLED: '0'
+        run: |
+          NAME="cyberlook-scan-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}"
+          [ "${{ matrix.goos }}" = windows ] && NAME="$NAME.exe"
+          go build -trimpath -ldflags="-s -w" -o "dist/$NAME" ./cmd/cyberlook-scan
+          ls -l "dist/$NAME"
+
+      - name: 产物自检（架构头必须对得上）
+        run: |
+          F="dist/cyberlook-scan-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}"
+          [ "${{ matrix.goos }}" = windows ] && F="$F.exe"
+          if [ "${{ matrix.goos }}" = windows ]; then
+            # MZ 头 + PE
+            head -c 2 "$F" | xxd -p | grep -qi '^4d5a' || { echo "不是 PE 文件"; exit 1; }
+          else
+            # ELF magic + 目标架构（03=386, 3e=amd64, b7=arm64, 08=MIPS）
+            head -c 4 "$F" | xxd -p | grep -qi '^7f454c46' || { echo "不是 ELF 文件"; exit 1; }
+            case "${{ matrix.goarch }}" in
+              amd64) WANT=3e ;; arm64) WANT=b7 ;; 386) WANT=03 ;; mipsle) WANT=08 ;;
+            esac
+            M=$(od -An -tx1 -j18 -N1 "$F" | tr -d ' \n')
+            [ "$M" = "$WANT" ] || { echo "e_machine=$M 期望 $WANT"; exit 1; }
+          fi
+          echo "架构自检通过：$F"
+
+      - name: 校验无 CGO 依赖（ldd 必须报 "not a dynamic executable"）
+        if: matrix.goos == 'linux' && matrix.goarch != 'mipsle'
+        run: |
+          F="dist/cyberlook-scan-${{ matrix.goos }}-${{ matrix.goarch }}"
+          ldd "$F" 2>&1 | tee /tmp/ldd.txt || true
+          grep -qi 'not a dynamic executable\|statically linked' /tmp/ldd.txt || {
+            echo "!! 产物动态链接了，不满足零依赖要求"; cat /tmp/ldd.txt; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cyberlook-scan-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  # ── 3. 发布：仅 tag 触发，把 5 个产物 + sha256 挂到 Release ──────────
+  release:
+    name: release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 生成校验和
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*
+          generate_release_notes: true
+          body: |
+            CyberLook-Scan ${{ github.ref_name }} —— 自研端口扫描 / 服务识别引擎
+
+            **纯 Go、CGO_ENABLED=0**，无需 gcc 与第三方库，麒麟（含低版本 glibc）、Ubuntu、龙芯 mipsle 直接可用。
+
+            | 平台 | 文件 |
+            |---|---|
+            | Linux x86_64 | `cyberlook-scan-linux-amd64` |
+            | Linux arm64（鲲鹏/飞腾） | `cyberlook-scan-linux-arm64` |
+            | Linux 386 | `cyberlook-scan-linux-386` |
+            | Linux mipsle softfloat（龙芯） | `cyberlook-scan-linux-mipsle-softfloat` |
+            | Windows x86_64 | `cyberlook-scan-windows-amd64.exe` |
+
+            ```bash
+            ./cyberlook-scan -h          # 用法
+            ./cyberlook-scan -version    # 版本
+            ```
+
+            指纹规则已内置；规则更新用 `-rules-update` 子命令。
+            校验：`sha256sum -c SHA256SUMS.txt`
