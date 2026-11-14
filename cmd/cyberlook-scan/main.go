@@ -26,7 +26,7 @@ import (
 	"github.com/RongSec/CyberLook-Scan/svcid"
 )
 
-const version = "1.4.3"
+const version = "1.4.4"
 
 const banner = `
    ____                          __  __
@@ -146,11 +146,13 @@ func main() {
 	portsSpec := flag.String("ports", "top100", "端口表达式")
 	exclude := flag.String("exclude", "", "排除目标")
 	conc := flag.Int("concurrency", 1500, "并发连接数")
+	perHostPPS := flag.Int("per-host-pps", 300, "单个目标的探针速率上限（0=不限）；单机全端口扫描靠它避免 SYN 突发被防火墙丢包")
 	timeoutMs := flag.Int("timeout", 1500, "单端口超时毫秒")
 	alive := flag.Bool("alive", false, "扫描前先存活探测，只对存活主机端口扫描")
 	aliveOnly := flag.Bool("alive-only", false, "只探存活，输出活主机清单（优先于 -alive）")
 	alivePortsSpec := flag.String("alive-ports", "", "存活探测端口（默认 80,443,22,445,3389,8080,8443,135,139,3306）")
 	aliveTimeoutMs := flag.Int("alive-timeout", 400, "存活探测单端口超时毫秒")
+	aliveAdaptive := flag.Bool("alive-adaptive", true, "存活探测抽样复核：发现假阴性自动降速重扫")
 	doIdent := flag.Bool("identify", false, "扫描后做服务识别")
 	rulesDir := flag.String("rules", "data/fingerprint", "规则路径：逗号分隔的目录或 .json 文件")
 	noProbes := flag.Bool("no-probes", false, "不做主动探针")
@@ -235,10 +237,17 @@ func main() {
 		}
 		fmt.Printf("[存活] 探测 %d 个主机 × %d 个常用端口 %v，并发 %d，超时 %s\n",
 			len(targets), len(alivePorts), alivePorts, *conc, aliveTimeout)
-		hosts, ast := portscan.AliveProbeStats(ctx, targets, alivePorts, *conc, aliveTimeout)
+		hosts, ast := portscan.DiscoverHosts(ctx, targets, portscan.AliveOptions{
+			Ports: alivePorts, Concurrency: *conc, TCPTimeout: aliveTimeout,
+			ICMP: true, Adaptive: *aliveAdaptive,
+		})
 		aliveHosts = hosts
 		fmt.Printf("[存活] %d/%d 主机存活（%.1fs，探针 %d，短路跳过 %d）\n",
 			ast.Alive, ast.Hosts, ast.Elapsed.Seconds(), ast.Probes, ast.Skipped)
+		if ast.SampledN > 0 {
+			fmt.Printf("[存活] 复核 %d 台判死主机，发现 %d 台其实活着；退避 %d 轮，并发 %d\n",
+				ast.SampledN, ast.SampledAlive, ast.Passes, ast.ConcUsed)
+		}
 		printAliveSummary(hosts)
 
 		if aliveOnlyMode {
@@ -317,6 +326,7 @@ func main() {
 	opens, st, err := portscan.Scan(ctx, targets, ports, portscan.Options{
 		Concurrency: *conc,
 		Timeout:     timeout,
+		PerHostPPS:  *perHostPPS,
 		OnProgress: func(done, total, open int64) {
 			if !*quiet {
 				fmt.Printf("[进度] %d/%d（%.1f%%）开放 %d\n", done, total, float64(done)*100/float64(total), open)

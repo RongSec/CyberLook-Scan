@@ -69,7 +69,18 @@ type AliveStats struct {
 	Unreach  int           // ICMP 明确不可达的台数
 	ICMPSkip bool          // ICMP 阶段是否被跳过（无权限/非 Linux/关闭）
 	Elapsed  time.Duration // 总耗时
+
+	// 抽样复核（自适应退避）的结果——这几个数就是"首轮到底漏没漏"的证据。
+	SampledN     int  // 被判死的主机里抽样复核了多少台
+	SampledAlive int  // 复核时发现"其实活着"的台数
+	Passes       int  // 因为发现假阴性而重扫了几轮（0=一次过，说明首轮可信）
+	Adjusted     bool // 是否降过速
+	ConcUsed     int  // 退避后实际使用的并发
 }
+
+// aliveMissTolerance 复核发现的"漏判率"阈值：低于它算噪声，不值得为它全量重扫。
+// 2% 是经验值——一张网里真有 2% 的存活主机被整批漏掉，已经不是抖动而是限速了。
+const aliveMissTolerance = 0.02
 
 // AliveOptions 存活探测参数（零值即可用）。
 type AliveOptions struct {
@@ -81,6 +92,9 @@ type AliveOptions struct {
 	// 只关心"活着/没活着"的调用方（平台）打开它，能省掉一轮无用探针；
 	// 需要 OpenPorts 真值的调用方（CLI）必须关闭，否则端口列表是空的。
 	SkipTCPIfAlive bool
+	// Adaptive 开启抽样复核与自适应退避：抽一小批"判死"的主机低速重探，
+	// 发现有假阴性就把并发砍半、重扫判死主机。多花一点时间换准确性。
+	Adaptive bool
 	// OnProgress 进度回调（done=已处理主机数，alive=当前存活数，均为 0..Hosts 内单调递增）；
 	// 返回 false 中止探测。回调会被节流（约每 0.7s 一次 + 每个 ICMP 批次一次），
 	// 可以直接在里面写库/推 SSE。
@@ -178,23 +192,16 @@ func DiscoverHosts(ctx context.Context, ips []string, opt AliveOptions) ([]Alive
 		})
 	}
 	atomic.StoreInt64(&icmpDone, int64(n))
-	if icmpSkip {
-		// ICMP 不可用（无权限/平台不支持）：整段算 0 成本，进度由 TCP 阶段一肩挑
-		atomic.StoreInt64(&icmpDone, int64(n))
-	}
 
-	// ===== 阶段 2：TCP（跳过 ICMP 明确不可达的；可选跳过 ICMP 已判活的）=====
-	skip := unreach
+	// ===== 阶段 2：TCP =====
+	skip := make(map[string]bool, len(unreach)+len(icmpAlive))
+	for ip := range unreach {
+		skip[ip] = true
+	}
 	if opt.SkipTCPIfAlive {
-		skip = make(map[string]bool, len(unreach)+len(icmpAlive))
-		for ip := range unreach {
-			skip[ip] = true
-		}
 		for ip := range icmpAlive {
 			skip[ip] = true
 		}
-		// 这些主机已经处理完了，先记进第二遍的完成数，进度才不会原地不动
-		atomic.StoreInt64(&tcpDone, int64(len(icmpAlive)))
 	}
 	targets := make([]string, 0, len(ips))
 	for _, ip := range ips {
@@ -202,6 +209,131 @@ func DiscoverHosts(ctx context.Context, ips []string, opt AliveOptions) ([]Alive
 			continue
 		}
 		targets = append(targets, ip)
+	}
+	// ICMP 已判活的主机不再进 TCP：它们算第二遍的完成数，进度才不会原地踏步
+	atomic.StoreInt64(&tcpDone, int64(len(icmpAlive)))
+
+	tcpAlive, tcpPorts, probes, skipped := tcpSweep(ctx, targets, ports, concurrency, timeout, func(done, alive int) {
+		atomic.StoreInt64(&tcpDone, int64(len(icmpAlive)+done))
+		atomic.StoreInt64(&aliveNum, int64(len(icmpAlive)+alive))
+		report()
+	})
+	tcpDoneFinal := int64(len(targets))
+
+	// ===== 阶段 2b：抽样复核 + 自适应退避 =====
+	// 为什么要复核：一张网里"没回应"有两种原因——主机真死了，或者我们的 SYN
+	// 被目标的限速/IPS 丢了。后者是把开着的端口判成关闭（假阴性），从结果里
+	// 看不出来。所以随机抽一小批"判死"的主机，用低速率再探一遍：如果它们
+	// 其实活着，说明首轮太快，就把并发砍半重扫剩下的判死主机。
+	if opt.Adaptive {
+		for round := 0; round < 2; round++ {
+			dead := make([]string, 0, len(targets))
+			for _, ip := range targets {
+				if !tcpAlive[ip] {
+					dead = append(dead, ip)
+				}
+			}
+			if len(dead) == 0 {
+				break
+			}
+			sample := sampleIPs(dead, aliveSampleSize(len(dead)), round)
+			slow := concurrency / 8
+			if slow < 64 {
+				slow = 64
+			}
+			if slow > 256 {
+				slow = 256
+			}
+			sAlive, _, _, _ := tcpSweep(ctx, sample, ports, slow, timeout, nil)
+			st.SampledN += len(sample)
+			st.SampledAlive += len(sAlive)
+			if len(sAlive) == 0 {
+				break // 抽到的都是真死的 → 首轮可信
+			}
+			missRate := float64(len(sAlive)) / float64(len(sample))
+			if missRate < aliveMissTolerance {
+				break // 噪声级，不值得为它重扫
+			}
+			// 确认存在假阴性：降速重扫全部判死主机
+			next := concurrency / 2
+			if next < 128 {
+				next = 128
+			}
+			if next >= concurrency {
+				break // 已经到下限，再降没意义
+			}
+			st.Adjusted = true
+			st.ConcUsed = next
+			retry := make([]string, 0, len(dead))
+			for _, ip := range dead {
+				if !sAlive[ip] {
+					retry = append(retry, ip)
+				}
+			}
+			reAlive, rePorts, _, _ := tcpSweep(ctx, retry, ports, next, timeout, func(done, alive int) {
+				atomic.StoreInt64(&tcpDone, tcpDoneFinal+int64(done))
+				report()
+			})
+			tcpDoneFinal += int64(len(retry))
+			for ip := range reAlive {
+				tcpAlive[ip] = true
+				tcpPorts[ip] = rePorts[ip]
+			}
+			concurrency = next
+			st.Passes++
+			// 复核找到的也计入样本口径，避免下一轮重复把同一批当天真
+			st.SampledAlive += len(reAlive)
+			if len(reAlive) == 0 {
+				break
+			}
+		}
+	}
+
+	// ===== 合并：ICMP 或 TCP 任一判活即存活 =====
+	out := make([]AliveHost, 0, len(ips)/4)
+	for _, ip := range ips {
+		if !icmpAlive[ip] && !tcpAlive[ip] {
+			continue
+		}
+		ps := tcpPorts[ip]
+		if ps == nil {
+			ps = []int{}
+		}
+		out = append(out, AliveHost{IP: ip, OpenPorts: ps})
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].IP < out[b].IP })
+
+	st.Probes = probes
+	st.Skipped = skipped
+	st.Alive = len(out)
+	st.ByICMP = countTrue(icmpAlive, ips)
+	for _, ip := range targets {
+		if tcpAlive[ip] {
+			st.ByTCP++
+		}
+	}
+	st.Unreach = len(unreach)
+	st.ICMPSkip = icmpSkip
+	st.Elapsed = time.Since(start)
+
+	// 收尾：把进度顶到 100%（前面按两遍各半归一化，末尾补齐误差）
+	atomic.StoreInt64(&icmpDone, int64(n))
+	atomic.StoreInt64(&tcpDone, int64(n))
+	atomic.StoreInt64(&aliveNum, int64(len(out)))
+	_ = report()
+	return out, st
+}
+
+// tcpSweep 对一批主机按端口集做 connect 探测，返回 {ip: 开放端口}。
+// onProgress(done, alive)：done/alive 都是"本批"口径，由调用方叠加到全局进度。
+func tcpSweep(ctx context.Context, targets []string, ports []int, concurrency int, timeout time.Duration, onProgress func(done, alive int)) (map[string]bool, map[string][]int, int64, int64) {
+	alive := make(map[string]bool, len(targets)/4)
+	openPorts := make(map[string][]int, len(targets)/4)
+	if len(targets) == 0 {
+		return alive, openPorts, 0, 0
+	}
+	if concurrency <= 0 {
+		concurrency = 512
 	}
 
 	type job struct {
@@ -216,17 +348,17 @@ func DiscoverHosts(ctx context.Context, ips []string, opt AliveOptions) ([]Alive
 		remaining[i] = int32(len(ports))
 	}
 	hits := make([]aliveHit, len(targets))
-	var probes, skipped int64
+	var probes, skipped, doneCount, aliveCount int64
 
 	// finishHost 每台主机只认第一次：CAS 失败说明已经计过数了。
-	// aliveNum 的累加必须挂在这个闸门上 —— 两个端口并发连通同一台主机时，
+	// aliveCount 的累加必须挂在这个闸门上 —— 两个端口并发连通同一台主机时，
 	// 各自都会走到"判活"分支，不设闸门就会把这台机器算两次
 	// （实测 /16 上进度里报 1703 台存活，实际只有 977 台）。
-	finishHost := func(i int, alive bool) {
+	finishHost := func(i int, isAlive bool) {
 		if atomic.CompareAndSwapInt32(&finished[i], 0, 1) {
-			atomic.AddInt64(&tcpDone, 1)
-			if alive {
-				atomic.AddInt64(&aliveNum, 1)
+			atomic.AddInt64(&doneCount, 1)
+			if isAlive {
+				atomic.AddInt64(&aliveCount, 1)
 			}
 		}
 	}
@@ -270,22 +402,23 @@ func DiscoverHosts(ctx context.Context, ips []string, opt AliveOptions) ([]Alive
 	repCtx, stopRep := context.WithCancel(ctx)
 	defer stopRep()
 	repDone := make(chan struct{})
-	go func() {
-		defer close(repDone)
-		t := time.NewTicker(700 * time.Millisecond)
-		defer t.Stop()
-		for {
-			select {
-			case <-repCtx.Done():
-				return
-			case <-t.C:
-				if !report() {
-					stopRep()
+	if onProgress != nil {
+		go func() {
+			defer close(repDone)
+			t := time.NewTicker(700 * time.Millisecond)
+			defer t.Stop()
+			for {
+				select {
+				case <-repCtx.Done():
 					return
+				case <-t.C:
+					onProgress(int(atomic.LoadInt64(&doneCount)), int(atomic.LoadInt64(&aliveCount)))
 				}
 			}
-		}
-	}()
+		}()
+	} else {
+		close(repDone)
+	}
 
 dispatch:
 	for i := range targets {
@@ -307,46 +440,52 @@ dispatch:
 	stopRep()
 	<-repDone
 
-	// ===== 合并：ICMP 或 TCP 任一判活即存活 =====
-	aliveIdx := make(map[string]int, len(targets))
 	for i, ip := range targets {
-		aliveIdx[ip] = i
-	}
-	out := make([]AliveHost, 0, len(ips)/4)
-	for _, ip := range ips {
-		_, byTCP := aliveIdx[ip]
-		byTCP = byTCP && atomic.LoadInt32(&tcpAlive[aliveIdx[ip]]) == 1
-		if icmpAlive[ip] || byTCP {
-			ps := []int{}
-			if byTCP {
-				if v := hits[aliveIdx[ip]].sorted(); v != nil {
-					ps = v
-				}
+		if atomic.LoadInt32(&tcpAlive[i]) == 1 {
+			alive[ip] = true
+			ps := hits[i].sorted()
+			if ps == nil {
+				ps = []int{}
 			}
-			out = append(out, AliveHost{IP: ip, OpenPorts: ps})
+			openPorts[ip] = ps
 		}
 	}
-	sort.Slice(out, func(a, b int) bool { return out[a].IP < out[b].IP })
+	return alive, openPorts, atomic.LoadInt64(&probes), atomic.LoadInt64(&skipped)
+}
 
-	st.Probes = atomic.LoadInt64(&probes)
-	st.Skipped = atomic.LoadInt64(&skipped)
-	st.Alive = len(out)
-	st.ByICMP = countTrue(icmpAlive, ips)
-	for _, ip := range targets {
-		if atomic.LoadInt32(&tcpAlive[aliveIdx[ip]]) == 1 {
-			st.ByTCP++
-		}
+// aliveSampleSize 复核抽样量：2%，夹在 [64, 400]。抽少了判不出来，抽多了白花钱。
+func aliveSampleSize(dead int) int {
+	n := dead / 50
+	if n < 64 {
+		n = 64
 	}
-	st.Unreach = len(unreach)
-	st.ICMPSkip = icmpSkip
-	st.Elapsed = time.Since(start)
+	if n > 400 {
+		n = 400
+	}
+	if n > dead {
+		n = dead
+	}
+	return n
+}
 
-	// 收尾：把进度顶到 100%（前面按两遍各半归一化，末尾补齐误差）
-	atomic.StoreInt64(&icmpDone, int64(n))
-	atomic.StoreInt64(&tcpDone, int64(n))
-	atomic.StoreInt64(&aliveNum, int64(len(out)))
-	_ = report()
-	return out, st
+// sampleIPs 均匀抽样（按步长取，确定性、不引入随机源，复测可比）。
+func sampleIPs(ips []string, n, round int) []string {
+	if n >= len(ips) {
+		return ips
+	}
+	if n <= 0 {
+		return nil
+	}
+	step := len(ips) / n
+	if step < 1 {
+		step = 1
+	}
+	out := make([]string, 0, n)
+	off := (round * 37) % step // 每一轮错开，避免总抽同一批
+	for i := off; i < len(ips) && len(out) < n; i += step {
+		out = append(out, ips[i])
+	}
+	return out
 }
 
 // ===== ICMP 阶段 =====

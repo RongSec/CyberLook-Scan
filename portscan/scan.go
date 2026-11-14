@@ -45,6 +45,14 @@ type Options struct {
 	// Controls 运行期调控句柄；nil = 内部按 Concurrency/Timeout 自建
 	// （默认行为与固定并发等价）。传入后可在扫描期间 SetLimit/SetTimeoutMs/Pause/Resume。
 	Controls *Controls
+	// PerHostPPS 单目标主机的探针速率上限（0 = 不限）。
+	//
+	// 为什么需要：并发上限是**全局**的，扫单台主机的 65535 个端口时，
+	// 派发协程会把这 1500 个许可全打在同一台机器上 —— 一秒钟 1500 个 SYN。
+	// 绝大多数防火墙/IPS 对"同一目的 IP 的新建连接"有每秒上限，超出的包被
+	// **静默丢弃**，于是开着的端口表现为"超时=关闭"，这就是顺序全端口扫描的假阴性来源。
+	// 卡在每秒几百个以内，丢包率才降到可忽略。
+	PerHostPPS int
 }
 
 // Result 一个开放端口
@@ -156,10 +164,26 @@ func Scan(ctx context.Context, targets []string, ports []int, opt Options) ([]Re
 
 	var wg sync.WaitGroup
 	var cancelled bool
+	// 派发顺序决定"谁在短时间内挨了多少包"：
+	//   - 多目标：端口放外层、目标放内层做轮转。任何一台主机在整个扫描期间只会
+	//     每隔 len(targets) 个探针被碰一次，天然不会形成突发。
+	//   - 单目标（典型：一台主机的全端口扫描）：只有一个 IP，轮转没意义，必须靠
+	//     速率令牌放行，否则全局并发 1500 会在一秒内变成 1500 个 SYN 打同一台机器。
+	// 只对"单目标"启用令牌：多目标时轮转已经把单机速率摊到 total/len(targets)，
+	// 而令牌是串行等待——给 N 台各挂一个桶会把总吞吐压到 pps（而不是 N×pps），
+	// 反而更慢。目标台数多的时候靠轮转就够，不需要再按主机卡。
+	var pacer *hostPacer
+	if opt.PerHostPPS > 0 && len(targets) == 1 {
+		pacer = newHostPacer(opt.PerHostPPS)
+	}
 dispatch:
-	for _, ip := range targets {
-		for _, p := range ports {
+	for _, p := range ports {
+		for _, ip := range targets {
 			if ctx.Err() != nil {
+				cancelled = true
+				break dispatch
+			}
+			if pacer != nil && !pacer.wait(ctx) {
 				cancelled = true
 				break dispatch
 			}
@@ -419,4 +443,55 @@ var TopN = []int{
 	8019, 8020, 8069, 8090, 8091, 8180, 8200, 8300, 8500, 8529, 8834, 8983,
 	9002, 9003, 9080, 9091, 9092, 9093, 9201, 9418, 9999, 10050, 10051, 11212,
 	15692, 27018, 50070, 50075, 50090, 61616, 61613, 10086, 10443, 12345,
+}
+
+// ===== 单主机速率令牌 =====
+
+// hostPacer 给"一次只扫一台主机"的场景限速。
+//
+// 为什么不用并发数控制：并发控制的是"同时在途多少"，而防火墙限制的是
+// "每秒新建多少"。1500 并发配 500ms 超时就是每秒 3000 个 SYN，远超常见
+// 每目的 IP 的 100~1000 pps 上限；把并发降到 100 又会让正常扫描慢 15 倍。
+// 令牌桶能同时满足"不触发限速"和"不浪费带宽"：burst 给 1 秒的量，稳态就是 pps。
+type hostPacer struct {
+	rate   float64
+	burst  float64
+	tokens float64
+	last   time.Time
+}
+
+func newHostPacer(pps int) *hostPacer {
+	return &hostPacer{rate: float64(pps), burst: float64(pps)} // 允许 1 秒的突发
+}
+
+// wait 取一个令牌，取不到就等到下一个令牌到期。返回 false 表示 ctx 结束。
+func (p *hostPacer) wait(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return false // 已取消：即使桶里有令牌也不再发
+	}
+	for {
+		now := time.Now()
+		if p.last.IsZero() {
+			p.last = now
+			p.tokens = p.burst
+		}
+		p.tokens += now.Sub(p.last).Seconds() * p.rate
+		if p.tokens > p.burst {
+			p.tokens = p.burst
+		}
+		p.last = now
+		if p.tokens >= 1 {
+			p.tokens--
+			return true
+		}
+		need := time.Duration((1 - p.tokens) / p.rate * float64(time.Second))
+		if need < time.Millisecond {
+			need = time.Millisecond
+		}
+		select {
+		case <-time.After(need):
+		case <-ctx.Done():
+			return false
+		}
+	}
 }

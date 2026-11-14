@@ -3,6 +3,7 @@ package portscan
 import (
 	"context"
 	"net"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -229,5 +230,65 @@ func TestAliveProbeSkipTCPIfAlive(t *testing.T) {
 	}
 	if st.Probes != 0 {
 		t.Errorf("SkipTCPIfAlive 下不应发出 TCP 探针，实际 %d", st.Probes)
+	}
+}
+
+// TestAliveSampleSizeAndSpread 抽样量夹在 [64,400]、抽样点不重复且分散
+func TestAliveSampleSizeAndSpread(t *testing.T) {
+	if n := aliveSampleSize(10); n != 10 {
+		t.Errorf("目标不足时取全部，得到 %d", n)
+	}
+	if n := aliveSampleSize(100000); n != 400 {
+		t.Errorf("大网段抽样上限 400，得到 %d", n)
+	}
+	ips := make([]string, 10000)
+	for i := range ips {
+		ips[i] = strconv.Itoa(i)
+	}
+	got := sampleIPs(ips, 200, 0)
+	if len(got) != 200 {
+		t.Fatalf("抽样数不对: %d", len(got))
+	}
+	seen := map[string]bool{}
+	for _, ip := range got {
+		if seen[ip] {
+			t.Fatalf("抽到了重复主机 %s", ip)
+		}
+		seen[ip] = true
+	}
+	// 第二轮必须错开，否则每轮都核同一批，"发现不了漏判"就永远发现不了
+	got2 := sampleIPs(ips, 200, 1)
+	if got[0] == got2[0] {
+		t.Errorf("两轮抽样起点相同（%s），没有错开", got[0])
+	}
+}
+
+// TestHostPacerRate 令牌桶稳态速率要贴近设定值（单机全端口扫描靠它避免 SYN 突发）
+func TestHostPacerRate(t *testing.T) {
+	p := newHostPacer(200) // 200 pps，burst 200
+	// 先耗尽 burst
+	for i := 0; i < 200; i++ {
+		if !p.wait(context.Background()) {
+			t.Fatal("wait 返回 false")
+		}
+	}
+	start := time.Now()
+	for i := 0; i < 100; i++ {
+		p.wait(context.Background())
+	}
+	el := time.Since(start)
+	// 100 个令牌 @200pps ≈ 500ms，允许 ±40%
+	if el < 300*time.Millisecond || el > 700*time.Millisecond {
+		t.Errorf("稳态度不符：100 个令牌用了 %s（期望 ~500ms）", el)
+	}
+}
+
+// TestHostPacerCancel 取消后不得卡死
+func TestHostPacerCancel(t *testing.T) {
+	p := newHostPacer(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if p.wait(ctx) {
+		t.Error("ctx 已取消，wait 应返回 false")
 	}
 }
