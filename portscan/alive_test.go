@@ -292,3 +292,29 @@ func TestHostPacerCancel(t *testing.T) {
 		t.Error("ctx 已取消，wait 应返回 false")
 	}
 }
+
+// TestDetectInterceptedPortsCanary 正常情况下保留地址不可达 → 不应判定为被接管
+func TestDetectInterceptedPortsCanary(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	// 65001 这类高位端口正常不会被任何代理接管；若这里也"连上"了，
+	// 说明测试环境本身有全局代理，跳过而不是误报。
+	bad, found := DetectInterceptedPorts(ctx, []int{65001, 65002}, 300*time.Millisecond)
+	if found {
+		t.Skipf("测试环境存在全局代理（%v），跳过", bad)
+	}
+	if len(bad) != 0 {
+		t.Errorf("不应有被接管的端口，得到 %v", bad)
+	}
+}
+
+// TestFilterPorts 剔除逻辑
+func TestFilterPorts(t *testing.T) {
+	got := filterPorts([]int{80, 443, 22, 445}, []int{80, 443})
+	if len(got) != 2 || got[0] != 22 || got[1] != 445 {
+		t.Errorf("剔除结果不对: %v", got)
+	}
+	if keep := filterPorts([]int{22}, nil); len(keep) != 1 {
+		t.Errorf("空集合不应改动: %v", keep)
+	}
+}

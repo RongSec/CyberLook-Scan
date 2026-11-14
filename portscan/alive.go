@@ -92,6 +92,9 @@ type AliveOptions struct {
 	// 只关心"活着/没活着"的调用方（平台）打开它，能省掉一轮无用探针；
 	// 需要 OpenPorts 真值的调用方（CLI）必须关闭，否则端口列表是空的。
 	SkipTCPIfAlive bool
+	// InterceptedPorts 被链路中间件接管的端口：对任何地址都"连接成功"，
+	// 用来判存活就是满屏假阳性，必须剔除。
+	InterceptedPorts []int
 	// Adaptive 开启抽样复核与自适应退避：抽一小批"判死"的主机低速重探，
 	// 发现有假阴性就把并发砍半、重扫判死主机。多花一点时间换准确性。
 	Adaptive bool
@@ -141,6 +144,12 @@ func DiscoverHosts(ctx context.Context, ips []string, opt AliveOptions) ([]Alive
 	ports := opt.Ports
 	if len(ports) == 0 {
 		ports = DefaultAlivePorts
+	}
+	// 中间件代答的端口不能用于判活（实测 80/443 对任意地址 1ms "成功"）
+	if len(opt.InterceptedPorts) > 0 {
+		if kept := filterPorts(ports, opt.InterceptedPorts); len(kept) > 0 {
+			ports = kept
+		}
 	}
 	timeout := opt.TCPTimeout
 	if timeout <= 0 {

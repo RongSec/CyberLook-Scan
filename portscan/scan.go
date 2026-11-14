@@ -45,6 +45,9 @@ type Options struct {
 	// Controls 运行期调控句柄；nil = 内部按 Concurrency/Timeout 自建
 	// （默认行为与固定并发等价）。传入后可在扫描期间 SetLimit/SetTimeoutMs/Pause/Resume。
 	Controls *Controls
+	// InterceptedPorts 被链路中间件接管的端口（见 intercept.go）。
+	// 这些端口 connect 一定"成功"（设备代答），扫了只会得到假阳性，直接跳过。
+	InterceptedPorts []int
 	// PerHostPPS 单目标主机的探针速率上限（0 = 不限）。
 	//
 	// 为什么需要：并发上限是**全局**的，扫单台主机的 65535 个端口时，
@@ -98,6 +101,13 @@ func Scan(ctx context.Context, targets []string, ports []int, opt Options) ([]Re
 	}
 	if opt.Concurrency <= 0 {
 		opt.Concurrency = 4096
+	}
+	// 被中间件接管的端口直接剔除：这类端口对任何地址都"连接成功"，
+	// 扫出来的"开放"是设备代答，不是主机在监听。
+	if len(opt.InterceptedPorts) > 0 {
+		if kept := filterPorts(ports, opt.InterceptedPorts); len(kept) > 0 {
+			ports = kept
+		}
 	}
 	if opt.Timeout <= 0 {
 		opt.Timeout = 500 * time.Millisecond
