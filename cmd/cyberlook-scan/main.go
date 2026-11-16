@@ -26,7 +26,7 @@ import (
 	"github.com/RongSec/CyberLook-Scan/svcid"
 )
 
-const version = "1.4.5"
+const version = "1.5.0"
 
 const banner = `
    ____                          __  __
@@ -302,8 +302,12 @@ func main() {
 		}
 	}
 
-	fmt.Printf("[扫描] 目标 %d 个 × 端口 %d 个 = %d 探针，并发 %d，超时 %s\n",
-		len(targets), len(ports), len(targets)*len(ports), *conc, timeout)
+	// 与平台队列单元共用同一套回显（portscan.Format*），两处日志才对得上
+	fmt.Println(portscan.FormatParamsLine(portscan.ReportParams{
+		Concurrency: *conc, TimeoutMs: int(timeout.Milliseconds()),
+		Identify: *doIdent, IdentWorkers: 0, FullFinger: *doIdent,
+		Targets: len(targets), Ports: len(ports),
+	}))
 
 	// 规则
 	var rs *svcid.RuleSet
@@ -323,13 +327,16 @@ func main() {
 		}
 	}
 
+	scanStart := time.Now()
 	opens, st, err := portscan.Scan(ctx, targets, ports, portscan.Options{
 		Concurrency: *conc,
 		Timeout:     timeout,
 		PerHostPPS:  *perHostPPS,
 		OnProgress: func(done, total, open int64) {
 			if !*quiet {
-				fmt.Printf("[进度] %d/%d（%.1f%%）开放 %d\n", done, total, float64(done)*100/float64(total), open)
+				fmt.Println(portscan.FormatProgressLine(portscan.ReportProgress{
+					Done: done, Total: total, Open: open, Elapsed: time.Since(scanStart),
+				}))
 			}
 		},
 	})
@@ -358,6 +365,11 @@ func main() {
 	for _, r := range opens {
 		out.OpenPorts = append(out.OpenPorts, fmt.Sprintf("%s:%d", r.IP, r.Port))
 	}
+
+	fmt.Println(portscan.FormatDoneLine(portscan.ReportDone{
+		Probes: st.Probes, Total: int64(len(targets) * len(ports)),
+		Elapsed: st.Elapsed, Open: int64(st.Open), Ident: int64(len(opens)),
+	}))
 
 	fmt.Printf("\n===== 扫描结果 =====\n")
 	if aliveMode {
