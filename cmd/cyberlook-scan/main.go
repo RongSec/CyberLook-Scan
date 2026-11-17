@@ -51,12 +51,14 @@ const usage = `用法:
 扫描参数:
   -concurrency int     并发连接数（默认 1500）
   -timeout int         单端口超时毫秒（<100 视为秒，默认 1500）
+  -per-host-pps int    单个目标的探针速率上限（默认 300，0=不限）；单机全端口靠它避免 SYN 突发被丢包
 
 存活探测:
-  -alive               扫描前先做 TCP connect 存活探测，只对存活主机做端口扫描
+  -alive               扫描前先做存活探测（ICMP 批量 + TCP 兜底），只对存活主机做端口扫描
   -alive-only          只探存活：输出活主机清单，不做端口扫描、不做识别（优先级高于 -alive）
   -alive-ports string  存活探测端口，逗号/区间语法（默认 80,443,22,445,3389,8080,8443,135,139,3306）
   -alive-timeout int   存活探测单端口超时毫秒（默认 400）
+  -alive-adaptive      存活探测抽样复核：发现假阴性自动降速重扫（默认 true）
 
 识别参数:
   -identify            扫描后做服务识别（协议/产品/版本/WEB 指纹）

@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 430" width="1000" height="430" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#64748b"/>
+    </marker>
+    <marker id="arb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="1000" height="430" fill="#ffffff"/>
+  <text x="24" y="32" font-size="17" font-weight="700" fill="#0f172a">引擎的四层：判定、派发、识别、留证</text>
+  <text x="24" y="52" font-size="12" fill="#64748b">每一层都只回答一个问题，出错时能定位到具体一层；层与层之间是流式管道，不是批处理。</text>
+
+  <!-- stage 1 -->
+  <rect x="24" y="78" width="200" height="104" rx="8" fill="#f8fafc" stroke="#d5dce6"/>
+  <text x="40" y="100" font-size="12.5" font-weight="700" fill="#0f172a">① 目标</text>
+  <text x="40" y="120" font-size="10.5" fill="#475569">IP / CIDR / 区间 / @file</text>
+  <text x="40" y="136" font-size="10.5" fill="#475569">去重、去排除项后展开</text>
+  <text x="40" y="156" font-size="10.5" fill="#64748b">产出：待探 IP 列表（已排序）</text>
+  <text x="40" y="172" font-size="10.5" fill="#94a3b8">不做任何网络动作</text>
+
+  <line x1="226" y1="130" x2="252" y2="130" stroke="#64748b" stroke-width="1.5" marker-end="url(#ar)"/>
+
+  <!-- stage 2 -->
+  <rect x="254" y="78" width="226" height="104" rx="8" fill="#eef6ff" stroke="#bcd4f6"/>
+  <text x="270" y="100" font-size="12.5" font-weight="700" fill="#0f172a">② 存活判定</text>
+  <text x="270" y="120" font-size="10.5" fill="#475569">ICMP 批量发 / 收（非特权 socket）</text>
+  <text x="270" y="136" font-size="10.5" fill="#475569">未响应的补 TCP 16 端口</text>
+  <text x="270" y="156" font-size="10.5" fill="#64748b">抽样复核：2% 判死主机低速重探</text>
+  <text x="270" y="172" font-size="10.5" fill="#94a3b8">漏判率 &gt;2% → 并发砍半重扫</text>
+
+  <line x1="482" y1="130" x2="508" y2="130" stroke="#64748b" stroke-width="1.5" marker-end="url(#ar)"/>
+
+  <!-- stage 3 -->
+  <rect x="510" y="78" width="226" height="104" rx="8" fill="#eef6ff" stroke="#bcd4f6"/>
+  <text x="526" y="100" font-size="12.5" font-weight="700" fill="#0f172a">③ 端口探针</text>
+  <text x="526" y="120" font-size="10.5" fill="#475569">connect 全连接（三次握手成功才算）</text>
+  <text x="526" y="136" font-size="10.5" fill="#475569">端口外层、目标内层轮转派发</text>
+  <text x="526" y="156" font-size="10.5" fill="#64748b">单机令牌桶 + 全局 limiter</text>
+  <text x="526" y="172" font-size="10.5" fill="#94a3b8">EMFILE 记账，绝不默默当"关闭"</text>
+
+  <line x1="738" y1="130" x2="764" y2="130" stroke="#64748b" stroke-width="1.5" marker-end="url(#ar)"/>
+
+  <!-- stage 4 -->
+  <rect x="766" y="78" width="210" height="104" rx="8" fill="#f0fdf4" stroke="#bbf7d0"/>
+  <text x="782" y="100" font-size="12.5" font-weight="700" fill="#0f172a">④ 服务识别</text>
+  <text x="782" y="120" font-size="10.5" fill="#475569">协议探针 → 规则 → 主动探针</text>
+  <text x="782" y="136" font-size="10.5" fill="#475569">HTTP 抓页 / favicon / 证书</text>
+  <text x="782" y="156" font-size="10.5" fill="#64748b">产品名宁可空，不许编</text>
+  <text x="782" y="172" font-size="10.5" fill="#94a3b8">每端口 ≤3 组主动载荷</text>
+
+  <!-- output band -->
+  <path d="M871,182 L871,206" stroke="#64748b" stroke-width="1.5" marker-end="url(#ar)"/>
+  <rect x="700" y="208" width="276" height="66" rx="8" fill="#ffffff" stroke="#d5dce6"/>
+  <text x="716" y="228" font-size="11.5" font-weight="600" fill="#0f172a">输出三份，口径不同</text>
+  <text x="716" y="246" font-size="10.5" fill="#475569">结果集（内存/JSON）· 审计库（本地 SQLite）</text>
+  <text x="716" y="262" font-size="10.5" fill="#475569">终端三行（参数 / 进度 / 完成，平台同源）</text>
+
+  <!-- control plane -->
+  <rect x="24" y="208" width="640" height="66" rx="8" fill="#fff7ed" stroke="#fed7aa"/>
+  <text x="40" y="228" font-size="11.5" font-weight="600" fill="#0f172a">控制面（运行中可改，不必重启）</text>
+  <text x="40" y="246" font-size="10.5" fill="#475569">Controls：暂停 / 继续（暂停=0 许可，非 busy-wait）、调整在途上限、调整单探针超时</text>
+  <text x="40" y="262" font-size="10.5" fill="#64748b">配额与超时是唯一入口；派发协程每投一个探针前先领许可，在途数恒 ≤ 当前 limit</text>
+
+  <!-- observations -->
+  <rect x="24" y="292" width="952" height="66" rx="8" fill="#f8fafc" stroke="#d5dce6"/>
+  <text x="40" y="312" font-size="11.5" font-weight="600" fill="#0f172a">为什么值得信：三条不变量</text>
+  <text x="40" y="332" font-size="10.5" fill="#475569">① 不作弊地判定：connect 成功才算开放；RST = 关闭；超时 = 被过滤（三态分开统计，不合并成"关闭"）。</text>
+  <text x="40" y="350" font-size="10.5" fill="#475569">② 不静默失败：本地 fd 不足会累计并上报，超过阈值整轮结果判废（调用方回池重试），而不是少报一半端口。</text>
+
+  <!-- platform relation -->
+  <rect x="24" y="372" width="952" height="44" rx="8" fill="#eef6ff" stroke="#bcd4f6"/>
+  <text x="40" y="392" font-size="10.5" fill="#475569">同一模块被平台 require：平台 <tspan font-family="ui-monospace, SFMono-Regular, Menlo, monospace">require github.com/RongSec/CyberLook-Scan vX.Y.Z</tspan>，</text>
+  <text x="40" y="408" font-size="10.5" fill="#475569">所以 CLI 与平台队列跑的是同一份判定代码 —— 结论不一致时，先怀疑目标环境，再怀疑参数，最后才怀疑代码。</text>
+</svg>
