@@ -26,7 +26,7 @@ import (
 	"github.com/RongSec/CyberLook-Scan/svcid"
 )
 
-const version = "1.5.1"
+const version = "1.5.2"
 
 const banner = `
    ____                          __  __
@@ -67,6 +67,8 @@ const usage = `用法:
   -no-probes           只用被动探针，不发主动探针（等价 Finger=tiny）
   -deep-spa            空壳 SPA 深度识别（默认 true）：抓同源 JS + 只读配置接口，
                        从接口返回里取产品名；关掉可省掉每个 SPA 端口 1~6 秒
+  -render              浏览器渲染兜底（默认 false）：本机有 chromium 时，对仍未识别的
+                       页面真跑一遍 JS 再匹配。每端口 5~8 秒，适合小范围复核
 
 输出:
   -out string          结果 JSON 输出路径
@@ -161,6 +163,7 @@ func main() {
 	rulesDir := flag.String("rules", "data/fingerprint", "规则路径：逗号分隔的目录或 .json 文件")
 	noProbes := flag.Bool("no-probes", false, "不做主动探针")
 	deepSPA := flag.Bool("deep-spa", true, "空壳 SPA 深度识别：抓同源 JS 与只读配置接口（默认开）")
+	render := flag.Bool("render", false, "浏览器渲染兜底：机器上有 chromium 时，对仍未识别的页面真跑一遍 JS（每端口 5~8 秒）")
 	outPath := flag.String("out", "", "结果 JSON 输出路径")
 	quiet := flag.Bool("quiet", false, "只输出汇总")
 	reident := flag.String("reidentify", "", "只重跑识别")
@@ -171,6 +174,17 @@ func main() {
 		fmt.Print(usage)
 	}
 	flag.Parse()
+
+	// 渲染兜底的可执行文件只探测一次（节点上没浏览器就静默降级）
+	renderBin := ""
+	if *render {
+		renderBin = svcid.FindRenderer()
+		if renderBin == "" {
+			fmt.Println("[提示] -render 已开启，但本机找不到 chromium / chrome，渲染兜底将跳过")
+		} else {
+			fmt.Printf("[识别] 渲染兜底：%s（每端口 5~8 秒）\n", renderBin)
+		}
+	}
 
 	if *showVersion {
 		fmt.Printf("cyberlook-scan %s\n", version)
@@ -190,7 +204,7 @@ func main() {
 
 	// ===== 只重跑识别 =====
 	if *reident != "" {
-		runReidentify(*reident, *rulesDir, *outPath, *conc, *quiet, *deepSPA)
+		runReidentify(*reident, *rulesDir, *outPath, *conc, *quiet, *deepSPA, *render, renderBin)
 		return
 	}
 
@@ -405,7 +419,7 @@ func main() {
 			go func(ip string, port int) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				sv := svcid.Identify(ctx, ip, port, svcid.IdentOptions{Rules: rs, Probes: probes, DeepSPA: *deepSPA})
+				sv := svcid.Identify(ctx, ip, port, svcid.IdentOptions{Rules: rs, Probes: probes, DeepSPA: *deepSPA, Render: *render, RenderBin: renderBin})
 				mu.Lock()
 				out.Services = append(out.Services, sv)
 				out.ProtoStat[sv.Protocol]++
@@ -449,7 +463,7 @@ func main() {
 	}
 }
 
-func runReidentify(src, rulesDir, outPath string, conc int, quiet bool, deepSPA bool) {
+func runReidentify(src, rulesDir, outPath string, conc int, quiet bool, deepSPA bool, render bool, renderBin string) {
 	fmt.Print(banner)
 	b, err := os.ReadFile(src)
 	if err != nil {
@@ -493,7 +507,7 @@ func runReidentify(src, rulesDir, outPath string, conc int, quiet bool, deepSPA 
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			sv := svcid.Identify(ctx, ip, port, svcid.IdentOptions{Rules: rs, Probes: probes, DeepSPA: deepSPA})
+			sv := svcid.Identify(ctx, ip, port, svcid.IdentOptions{Rules: rs, Probes: probes, DeepSPA: deepSPA, Render: render, RenderBin: renderBin})
 			mu.Lock()
 			out.Services = append(out.Services, sv)
 			out.ProtoStat[sv.Protocol]++

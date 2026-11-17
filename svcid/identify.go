@@ -48,6 +48,12 @@ type IdentOptions struct {
 	DeepSPA bool
 	// SPABudget 是单个端口上 SPA 取证的总时间上限，默认 6s。
 	SPABudget time.Duration
+
+	// Render 打开浏览器渲染兜底（需要机器上有 chromium，见 render.go）。
+	// 只在前面所有手段都没拿到可信产品名时才跑，单端口约 5~8 秒。
+	Render        bool
+	RenderBin     string        // FindRenderer() 的结果，空表示不可用
+	RenderTimeout time.Duration // 默认 8s
 }
 
 // Identify 识别单个开放端口
@@ -158,6 +164,19 @@ func Identify(ctx context.Context, ip string, port int, opt IdentOptions) Servic
 					}
 				}
 			}
+			// 规则只命中"Web 服务器"这类基础设施，而标题明确指向某个系统时，
+			// 标题才是真正要的信息（实测：Graylog 的页面被报成 nginx，
+			// 因为 Graylog 那条规则要求两个词同时出现，页面上只有一个）。
+			if res.Source == "web-rule" && isInfraProduct(res.Product) && title != "" && !isJunkTitle(title) {
+				res.Product = title
+				res.Source = "http-title"
+			}
+			// 规则给出"通用 HTTP 服务"这类等于没说的产品名时，标题里的信息更多
+			// （实测：IBM Storwize V7000 的登录页被某条通用规则报成 Generic HTTP Server）
+			if res.Source == "web-rule" && isGenericProduct(res.Product) && title != "" && !isJunkTitle(title) {
+				res.Product = title
+				res.Source = "http-title"
+			}
 			if res.Product == "" && title != "" && !isJunkTitle(title) {
 				res.Product = title
 				res.Source = "http-title"
@@ -212,6 +231,35 @@ func Identify(ctx context.Context, ip string, port int, opt IdentOptions) Servic
 				}
 				if spa.JSNum > 0 {
 					res.Evidence = append(res.Evidence, "spa-js:"+strconv.Itoa(spa.JSNum))
+				}
+			}
+
+			// 2.6) 浏览器渲染兜底：真跑一遍 JS，拿渲染后的 DOM。
+			// 静态抓取和"抓 JS+接口"都失效时才用（每端口 5~8 秒，成本最高）。
+			if opt.Render && opt.RenderBin != "" && pageURL != "" && weakProduct(res.Product, res.Source) {
+				u := strings.TrimSuffix(pageURL, "/")
+				if u == "" {
+					u = "https://" + net.JoinHostPort(ip, strconv.Itoa(port)) + "/"
+				}
+				if dom, rok := RenderPage(ctx, opt.RenderBin, u, opt.RenderTimeout); rok {
+					text := htmlToText(dom)
+					rt := extractTitle(dom)
+					if rt != "" && !isJunkTitle(rt) {
+						res.Title = rt
+					}
+					if opt.Rules != nil {
+						if hits := opt.Rules.MatchWeb(hdrs, dom+"\n"+text, res.Title, mmh3, md5h); len(hits) > 0 {
+							res.Product = strings.TrimSpace(hits[0].Product)
+							res.Score = hits[0].Score
+							res.Source = "render-rule"
+							res.Evidence = append(res.Evidence, hits[0].RuleID+"("+hits[0].Name+")")
+						}
+					}
+					if res.Product == "" && res.Title != "" && !isJunkTitle(res.Title) {
+						res.Product = res.Title
+						res.Source = "render-title"
+					}
+					res.Evidence = append(res.Evidence, "render-dom:"+strconv.Itoa(len(dom)))
 				}
 			}
 		}
@@ -338,6 +386,9 @@ func httpFetchFollow(ctx context.Context, cl *http.Client, scheme, ip string, po
 		}
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, opt.MaxBodyBytes))
 		_ = resp.Body.Close()
+		// 内网存量系统大量是 GB2312/GBK 输出，不转码会导致中文标题变乱码、
+		// 中文规则全部匹配不上（见 charset.go 顶部说明）
+		b = ensureUTF8(b, resp.Header.Get("Content-Type"))
 		status := resp.StatusCode
 		// 记录最好的一跳（2xx 优先于 3xx 优先于 4xx/5xx）
 		rank := 100
@@ -431,6 +482,11 @@ func isJunkTitle(t string) bool {
 	for _, k := range []string{
 		"not found", "403 forbidden", "404", "400 bad request", "500 internal",
 		"error", "forbidden", "access denied", "unauthorized",
+		// 跳转页/状态页的标题会被 http-title 兜底当产品名（实测出现过 "302 Found"）
+		"301 moved", "302 found", "303 see other", "307 temporary", "308 permanent",
+		"moved permanently", "temporary redirect", "object moved",
+		"502 bad", "503 service", "504 gateway", "bad gateway", "service unavailable",
+		"default page", "default web site", "iis windows", "apache2 ubuntu", "apache2 debian",
 		"未找到", "错误", "禁止访问", "拒绝访问", "无法访问", "未授权",
 		"welcome", "index of", "it works", "test page", "loading", "webserver",
 	} {
@@ -481,5 +537,41 @@ func weakProduct(product, source string) bool {
 		return false
 	}
 	// http-title / tls-cert / http-version / port-hint 等
+	return true
+}
+
+// isGenericProduct 判断产品名是否属于"等于没识别"的通用名
+func isGenericProduct(p string) bool {
+	x := strings.ToLower(strings.TrimSpace(p))
+	if x == "" {
+		return true
+	}
+	for _, k := range []string{"generic", "http server", "web server", "unknown", "unidentified"} {
+		if strings.Contains(x, k) {
+			return true
+		}
+	}
+	switch x {
+	case "http", "https", "tcp", "udp", "ssl", "webserver":
+		return true
+	}
+	return false
+}
+
+// isInfraProduct 判断产品名是否只表示"这是个 Web 服务器"（不含业务系统信息）。
+// 这类名字在资产台账里几乎没有价值——知道是 nginx 并不能告诉人这台机器干什么。
+func isInfraProduct(p string) bool {
+	parts := strings.Split(p, ",")
+	for _, one := range parts {
+		x := strings.ToLower(strings.TrimSpace(one))
+		x = strings.SplitN(x, "/", 2)[0]
+		switch x {
+		case "nginx", "apache", "apache httpd", "httpd", "iis", "microsoft-iis",
+			"openresty", "tengine", "lighttpd", "caddy", "http", "https",
+			"generic http server", "apache-coyote", "tomcat":
+		default:
+			return false
+		}
+	}
 	return true
 }

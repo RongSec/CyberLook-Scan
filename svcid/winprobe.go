@@ -136,6 +136,9 @@ func normalizeProduct(s string) string {
 	if s == "" {
 		return ""
 	}
+	if !plausibleProduct(s) {
+		return ""
+	}
 	// 占位产品名（Unknown / unidentified / N/A / -）等于没识别。
 	// 留着会污染资产表：人以为识别成功了，实际只知道"是个 TCP 服务"。
 	switch strings.ToLower(strings.TrimSpace(s)) {
@@ -342,3 +345,60 @@ func mergeExtra(banner, extra string) string {
 }
 
 var _ = bytes.MinRead
+
+// plausibleProduct 判断一个产品名是否"像产品名"。
+//
+// FingerprintHub 的 service 规则里混着一批不能当产品名的 info.name：
+// 有把正则本身写成名字的（`([\d.]+)$`）、有写占位版本的（`OpenSSH X.X`）、
+// 有把响应头当名字的（`HSTS`）、有把状态行当名字的（`HTTP/1.1 400 Bad Request`）、
+// 还有把认证方式当名字的（`http基本认证`）。这些值进资产表只会制造"识别成功"的假象。
+//
+// 判据故意写得保守：只拒绝**明确不可能是产品名**的形态，宁可少拒不可误杀
+// （正常名字里出现括号的情况极少，但出现正则元字符的一定不是产品名）。
+func plausibleProduct(s string) bool {
+	t := strings.TrimSpace(s)
+	if len([]rune(t)) < 2 {
+		return false
+	}
+	// 正则元字符 / 反斜杠：规则名被写成 regex 的典型特征。
+	// 刻意不拦 + $ ( ) , ：这些在合法产品名里常见
+	// （`OpenSSH 10.0p2 Debian 7+deb13u4`、`SAP Message Server,release 722 (SP8)`），
+	// 而 `([\d.]+)$` 靠 [ ] 就拦住了。
+	if strings.ContainsAny(t, "[]\\^*?|") {
+		return false
+	}
+	// 引号/尖括号：banner 片段被截断的痕迹（`Microsoft SQL Server 2019 15.00.$I(1,">")`）
+	if strings.ContainsAny(t, "\"<>`") {
+		return false
+	}
+	// 占位版本号：OpenSSH X.X / OpenSSH x.xxx / sshd xxxxx
+	low := strings.ToLower(t)
+	if strings.Contains(low, "x.x") || strings.Contains(low, "x.xxx") || strings.Contains(low, "xxxx") {
+		return false
+	}
+	// 状态行
+	if strings.HasPrefix(low, "http/") || strings.Contains(low, "bad request") ||
+		strings.Contains(low, "not found") || strings.Contains(low, "internal server error") {
+		return false
+	}
+	// 纯技术名词/协议特性，不构成"产品"
+	switch low {
+	case "hsts", "hsts preload", "csp", "cors", "tls", "ssl", "tcp", "udp", "http", "https",
+		"basic auth", "http基本认证", "http basic auth", "digest auth", "ntlm",
+		"gzip", "deflate", "chunked", "keep-alive", "webserver", "web server", "http server":
+		return false
+	}
+	// 以标点开头：banner 片段被截断的典型形态（`.Sudo Audit Server 1.9.11p3." client message`）
+	if strings.ContainsRune(`.,;:!?"'/~#`, rune(t[0])) {
+		return false
+	}
+	// 全是符号或数字
+	hasLetter := false
+	for _, r := range t {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r > 0x2E80 {
+			hasLetter = true
+			break
+		}
+	}
+	return hasLetter
+}
