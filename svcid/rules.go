@@ -28,6 +28,14 @@ type WebMatcher struct {
 	Part            string   `json:"part"`
 	CaseInsensitive bool     `json:"case-insensitive"`
 
+	// Condition 是 matcher **内部**的词间关系：一个 word matcher 带多个 words 时，
+	// "and" 表示这些词必须同时出现，"or"/空 表示任一出现即算命中。
+	// FingerprintHub 里大量规则把条件写在这一层（实测 476 个 matcher / 422 条规则），
+	// 早期实现只认 http item 级的 matchers-condition，把内层 and 当 or 处理，
+	// 于是"只沾一个词"就命中——典型症状是 10.24.9.103:443 只因页面含 portal/login
+	// 被判成「中国电信 天翼宽带政企网关」，而规则要求的 loid_regist() 根本没出现。
+	Condition string `json:"condition"`
+
 	// 编译产物
 	res      []*regexp.Regexp
 	lowered  []string
@@ -103,7 +111,18 @@ type RuleSet struct {
 	// favicon md5 → 规则序号
 	faviconIndex map[string][]int32
 
+	// strict 需要"全词命中"复核的 matcher（内层 condition=and 且多词）。
+	// AC 只回答"某个词出现了"，回答不了"这几个词都出现了"，所以对这批额外校验一遍。
+	strict []strictWord
+
 	LoadMs int64
+}
+
+// strictWord 一个需要全词校验的 word matcher
+type strictWord struct {
+	rule  int32
+	match int32
+	words []string // 已按 case-insensitive 归一
 }
 
 // Load 加载 FingerprintHub 规则。
@@ -178,6 +197,7 @@ func Load(paths string) (*RuleSet, error) {
 				mid++
 				switch m.Type {
 				case "word":
+					var ws []string
 					for _, w := range m.Words {
 						w = strings.TrimSpace(w)
 						if w == "" {
@@ -186,9 +206,19 @@ func Load(paths string) (*RuleSet, error) {
 						if m.CaseInsensitive {
 							w = strings.ToLower(w)
 						}
+						ws = append(ws, w)
 						patterns = append(patterns, w)
 						rs.patRule = append(rs.patRule, int32(i))
 						rs.patMatch = append(rs.patMatch, int32(mid))
+					}
+					// 内层 condition=and 且多词：AC 只知道"命中过哪个词"，必须再全词复核一次。
+					// 复核用的语料统一是小写的，所以词也一并小写化（不受 case-insensitive 开关影响）。
+					if len(ws) > 1 && strings.EqualFold(strings.TrimSpace(m.Condition), "and") {
+						lowered := make([]string, 0, len(ws))
+						for _, w := range ws {
+							lowered = append(lowered, strings.ToLower(w))
+						}
+						rs.strict = append(rs.strict, strictWord{rule: int32(i), match: int32(mid), words: lowered})
 					}
 				case "regex":
 					for _, re := range m.Regex {
@@ -287,6 +317,19 @@ func (rs *RuleSet) MatchWeb(headers, body, title string, faviconMMH3 string, fav
 	hitMatcher := map[[2]int32]bool{}
 	for _, pi := range matchedPats {
 		hitMatcher[[2]int32{rs.patRule[pi], rs.patMatch[pi]}] = true
+	}
+	// 内层 condition=and 的 matcher：AC 命中过其中某个词还不够，所有词都得在
+	for _, sw := range rs.strict {
+		key := [2]int32{sw.rule, sw.match}
+		if !hitMatcher[key] {
+			continue // 一个词都没命中，本来就不算
+		}
+		for _, w := range sw.words {
+			if !strings.Contains(full, w) {
+				delete(hitMatcher, key)
+				break
+			}
+		}
 	}
 
 	var hits []Hit

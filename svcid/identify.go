@@ -42,6 +42,12 @@ type IdentOptions struct {
 	ProbeTimeout time.Duration // 默认 1.5s
 	HTTPTimeout  time.Duration // 默认 4s
 	MaxBodyBytes int64         // 默认 64KB
+
+	// DeepSPA 开启空壳 SPA 的二次取证（抓同源 JS + 只读配置接口）。
+	// 关掉时只做静态匹配，速度快但识别不出"前端渲染型"系统。
+	DeepSPA bool
+	// SPABudget 是单个端口上 SPA 取证的总时间上限，默认 6s。
+	SPABudget time.Duration
 }
 
 // Identify 识别单个开放端口
@@ -89,10 +95,21 @@ func Identify(ctx context.Context, ip string, port int, opt IdentOptions) Servic
 	// 2) HTTP：抓页面 + favicon，跑全量 web 规则
 	if isHTTPish(pr, port) {
 		httpOpt := opt
+		// SPA 取证要复用同一个 client（同 TLS 放宽、同不跟跨站重定向）
+		cl := &http.Client{
+			Timeout: opt.HTTPTimeout,
+			Transport: &http.Transport{
+				TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
+				DisableKeepAlives: true,
+			},
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
 		if pr.Product == "" && (pr.Protocol == "tcp" || pr.Protocol == "msrpc") {
 			httpOpt.HTTPTimeout = 2500 * time.Millisecond // 未知端口兜底，短超时
 		}
-		if hdrs, body, title, mmh3, md5h, certHint, status, isTLS, ok := grabHTTP(ctx, ip, port, httpOpt); ok {
+		if hdrs, body, title, mmh3, md5h, certHint, status, isTLS, ok, pageURL := grabHTTP(ctx, ip, port, httpOpt); ok {
 			res.Title, res.StatusCode, res.Body, res.BodyLen = title, status, body, len(body)
 			res.TLS = isTLS
 			if res.Protocol == "" || res.Protocol == "tcp" {
@@ -160,6 +177,43 @@ func Identify(ctx context.Context, ip string, port int, opt IdentOptions) Servic
 					res.Version = hv
 				}
 			}
+
+			// 2.5) 空壳 SPA 二次取证：静态匹配拿不到产品时，抓同源 JS + 只读配置接口。
+			// 这类系统（NGSOC 门户、大模型护栏、各类管理台）把产品名放在接口返回里，
+			// 浏览器打开能看到，纯 HTTP 抓取只能拿到一个空壳 <div id="app">。
+			// 只在"当前还没有可信产品名"时触发，避免给每个 200 页面都加一轮请求。
+			if opt.DeepSPA && looksLikeSPA(body) && weakProduct(res.Product, res.Source) {
+				budget := opt.SPABudget
+				if budget <= 0 {
+					budget = 6 * time.Second
+				}
+				sctx, cancel := context.WithTimeout(ctx, budget)
+				spa := spaEnrich(sctx, cl, pageURL, body, int(opt.HTTPTimeout/time.Millisecond))
+				cancel()
+				if spa.Title != "" && res.Title == "" {
+					res.Title = spa.Title
+				}
+				if spa.Corpus != "" && opt.Rules != nil {
+					// 用补语料再跑一次规则：接口里的 platformName / platformIntroduction
+					// 往往就是最权威的产品名，比页面残留词可靠得多。
+					if hits := opt.Rules.MatchWeb(hdrs, body+"\n"+spa.Corpus, res.Title, mmh3, md5h); len(hits) > 0 {
+						res.Product = strings.TrimSpace(hits[0].Product)
+						res.Score = hits[0].Score
+						res.Source = "spa-rule"
+						res.Evidence = append(res.Evidence, hits[0].RuleID+"("+hits[0].Name+")")
+					}
+				}
+				if res.Product == "" && spa.Title != "" {
+					res.Product = spa.Title
+					res.Source = "spa-title"
+				}
+				for _, e := range spa.APIHits {
+					res.Evidence = append(res.Evidence, e)
+				}
+				if spa.JSNum > 0 {
+					res.Evidence = append(res.Evidence, "spa-js:"+strconv.Itoa(spa.JSNum))
+				}
+			}
 		}
 	}
 	// 3) 主动探针：被动拿不到 banner 的端口，用 FingerprintHub 全量 service 规则探测
@@ -174,7 +228,9 @@ func Identify(ctx context.Context, ip string, port int, opt IdentOptions) Servic
 		res.Product = strings.ToUpper(res.Protocol)
 		res.Source = "port-hint"
 	}
-	res.Product = normalizeProduct(res.Product)
+	// normalizeProduct 会把 "A-B-C" 拆成三段再大写首字母，段落里原有的多余空格会留下来
+	// （实测 "AS2200G2 KWL 01   Login   Inspur AS2200G2"），这里统一折叠成单空格。
+	res.Product = strings.Join(strings.Fields(normalizeProduct(res.Product)), " ")
 	if len([]rune(res.Product)) < 2 {
 		res.Product = ""
 	}
@@ -210,7 +266,7 @@ func isHTTPish(pr ProbeResult, port int) bool {
 // grabHTTP 抓页面（容忍 3xx/4xx/自签证书/跨 scheme 重定向），返回 header/body/title/favicon 双哈希/证书线索。
 // 关键改动：**任何 HTTP 响应都算成功**（包括 301/403/500），因为 Server 头本身就能定产品；
 // 重定向失败时保留上一跳的响应，而不是整体放弃。
-func grabHTTP(ctx context.Context, ip string, port int, opt IdentOptions) (headers, body, title, mmh3, md5h, certHint string, statusCode string, isTLS, ok bool) {
+func grabHTTP(ctx context.Context, ip string, port int, opt IdentOptions) (headers, body, title, mmh3, md5h, certHint string, statusCode string, isTLS, ok bool, pageURL string) {
 	schemes := []string{"http", "https"}
 	if port == 443 || port == 8443 || port == 9443 {
 		schemes = []string{"https", "http"}
@@ -228,29 +284,29 @@ func grabHTTP(ctx context.Context, ip string, port int, opt IdentOptions) (heade
 	}
 
 	bestHeaders, bestBody, bestTitle, bestMMH3, bestMD5, bestCert := "", "", "", "", "", ""
-	bestStatus := ""
+	bestStatus, bestURL := "", ""
 	bestTLS, bestOK, bestScore := false, false, -1
 
 	for _, sch := range schemes {
-		hdrs, body, title, mmh3, md5h, cert, status, tlsOK, ok2, score := httpFetchFollow(ctx, cl, sch, ip, port, opt)
+		hdrs, body, title, mmh3, md5h, cert, status, finalURL, tlsOK, ok2, score := httpFetchFollow(ctx, cl, sch, ip, port, opt)
 		if !ok2 {
 			continue
 		}
 		if score > bestScore {
 			bestHeaders, bestBody, bestTitle, bestMMH3, bestMD5, bestCert = hdrs, body, title, mmh3, md5h, cert
-			bestStatus = status
+			bestStatus, bestURL = status, finalURL
 			bestTLS, bestOK, bestScore = tlsOK, true, score
 		}
 		if score >= 300 {
 			break // 2xx 已是最好的
 		}
 	}
-	return bestHeaders, bestBody, bestTitle, bestMMH3, bestMD5, bestCert, bestStatus, bestTLS, bestOK
+	return bestHeaders, bestBody, bestTitle, bestMMH3, bestMD5, bestCert, bestStatus, bestTLS, bestOK, bestURL
 }
 
 // httpFetchFollow 手动跟随同 host 重定向（最多 3 跳），任一跳有响应就算成功
 func httpFetchFollow(ctx context.Context, cl *http.Client, scheme, ip string, port int, opt IdentOptions) (
-	hdrs, body, title, mmh3, md5h, certHint string, statusCode string, isTLS, ok bool, score int) {
+	hdrs, body, title, mmh3, md5h, certHint string, statusCode, finalURL string, isTLS, ok bool, score int) {
 	host := net.JoinHostPort(ip, strconv.Itoa(port))
 	url := scheme + "://" + host + "/"
 	score = -1
@@ -270,7 +326,10 @@ func httpFetchFollow(ctx context.Context, cl *http.Client, scheme, ip string, po
 			sub := resp.TLS.PeerCertificates[0].Subject
 			cn := strings.TrimSpace(sub.CommonName)
 			org := strings.TrimSpace(strings.Join(sub.Organization, ","))
-			sb.WriteString("TLS-CN: " + cn + "\nTLS-O: " + org + "\n")
+			ou := strings.TrimSpace(strings.Join(sub.OrganizationalUnit, ","))
+			// OU 也要带上：BMC / 设备类自签证书常把产品线写在 OU
+			// （AMI MegaRAC 的证书就是 O=AMI + OU=MEGARAC + CN=ami.com）
+			sb.WriteString("TLS-CN: " + cn + "\nTLS-O: " + org + "\nTLS-OU: " + ou + "\n")
 			certHint = cn
 			if certHint == "" {
 				certHint = org
@@ -291,6 +350,7 @@ func httpFetchFollow(ctx context.Context, cl *http.Client, scheme, ip string, po
 		if rank > score {
 			hdrs, body, title = sb.String(), string(b), extractTitle(string(b))
 			statusCode = strconv.Itoa(status)
+			finalURL = url
 			score = rank
 			if fb, e := fetchFavicon(cl, scheme, ip, port); e == nil && len(fb) > 0 {
 				md5h = FaviconHashes(fb)
@@ -319,7 +379,7 @@ func httpFetchFollow(ctx context.Context, cl *http.Client, scheme, ip string, po
 		}
 		break
 	}
-	return hdrs, body, title, mmh3, md5h, certHint, statusCode, isTLS, ok, score
+	return hdrs, body, title, mmh3, md5h, certHint, statusCode, finalURL, isTLS, ok, score
 }
 
 func fetchFavicon(cl *http.Client, scheme, ip string, port int) ([]byte, error) {
@@ -353,6 +413,9 @@ func extractTitle(body string) string {
 		return ""
 	}
 	t := strings.TrimSpace(body[start : start+j])
+	// 标题里常有换行、Tab、连续空格（模板拼接的产物），
+	// 直接当产品名会写进资产表并带上\n，统一折叠成单空格。
+	t = strings.Join(strings.Fields(t), " ")
 	if len([]rune(t)) > 120 {
 		t = string([]rune(t)[:120])
 	}
@@ -400,4 +463,23 @@ func probeWindows2(ctx context.Context, ip string, port int, timeout time.Durati
 	}
 	defer conn.Close()
 	return probeWindows(conn, port)
+}
+
+// weakProduct 判断当前产品名是否属于"不可信兜底"，值得再做一轮 SPA 取证。
+// 强来源：主动探针、Windows 握手、service 探针、web 规则高分命中。
+// 弱来源：页面标题、TLS 证书、HTTP 头版本、端口猜测——这些在 SPA 站点上基本是空的或错的。
+func weakProduct(product, source string) bool {
+	if strings.TrimSpace(product) == "" {
+		return true
+	}
+	switch source {
+	case "probe", "win-probe", "service-probe":
+		return false
+	case "web-rule":
+		return false
+	case "spa-rule", "spa-title":
+		return false
+	}
+	// http-title / tls-cert / http-version / port-hint 等
+	return true
 }

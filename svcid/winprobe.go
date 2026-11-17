@@ -136,6 +136,12 @@ func normalizeProduct(s string) string {
 	if s == "" {
 		return ""
 	}
+	// 占位产品名（Unknown / unidentified / N/A / -）等于没识别。
+	// 留着会污染资产表：人以为识别成功了，实际只知道"是个 TCP 服务"。
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "unknown", "unidentified", "n/a", "none", "-", "tcp", "udp", "ssl":
+		return ""
+	}
 	if v, ok := canonicalProduct[strings.ToLower(strings.TrimSpace(s))]; ok {
 		return v
 	}

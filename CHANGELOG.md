@@ -5,6 +5,52 @@
 
 ---
 
+## [1.5.1] - 2026-11-17
+
+### 修复
+
+- **matcher 内的 `condition` 被忽略，导致大面积误报**：FingerprintHub 有 422 条规则
+  把词间关系写在 matcher 内部（`{"type":"word","words":["a","b"],"condition":"and"}`），
+  早期实现只认 HTTP item 级的 `matchers-condition`，内层 `and` 退化成 `or` ——
+  只要页面沾上其中一个词就算命中。
+  典型症状：`10.24.9.103:443` 页面里只有 `portal/login`，却被判成
+  「中国电信 天翼宽带政企网关」，而该规则要求的 `loid_regist()` 根本没出现。
+  现在加载时把这批 matcher 登记为"全词复核"，AC 命中后再逐词 `Contains` 校验。
+  整段 `10.24.9.0/24` 对比：识别率不变（91%），但 `安恒云堡垒机 → 明御数据库审计`、
+  `IBM HTTP Server → AMI MegaRAC` 这类具体错误被纠正。
+
+### 新增
+
+- **空壳 SPA 深度识别（`-deep-spa`，默认开）**：前端渲染型系统（管理台/网关/审计）
+  首页只有 `<div id="app">` 和空标题，产品名由 JS 运行时从接口取回，纯静态抓取必然识别不出。
+  新增 `svcid/spa.go`：按 `<base href>` 定位并抓同源 JS（≤2 个/≤1MB），
+  从 JS 字面量抽只读信息类接口（`loginPage`/`customize`/`status`/`version`…，
+  `login`/`captcha`/`delete` 等一律跳过），取 `platformName`/`platformIntroduction`
+  等字段拼成补语料再匹配一次。单端口总预算 6 秒，只在空壳页面触发。
+  实测识别出 `深信服 大模型安全护栏`（source=`spa-rule`），
+  整段 C 类网段识别耗时 10.24s → 10.25s。
+- **本地规则文件** `data/fingerprint/web_fingerprint_v4_local.json`：
+  深信服大模型安全护栏、深信服统一门户(APEX)、AMI MegaRAC BMC 三条，
+  与上游 `rules-update` 互不影响（文件名刻意匹配 `web_fingerprint_v4*` 的 glob）。
+
+### 改进
+
+- **TLS 证书 OU 纳入识别语料**：BMC 类设备的产品线只写在 OU（`O=AMI / OU=MEGARAC`），
+  只看 CN/O 会漏。
+- **标题与产品名空白归一**：`<title>` 里的换行/连续空格折叠成单空格，
+  `normalizeProduct` 拆分后残留的多余空格也一并收掉
+  （原样写进资产表会是 `AS2200G2 KWL 01   Login   Inspur AS2200G2`）。
+- **占位产品名不再入库**：`Unknown`/`unidentified`/`N-A`/`ssl`/`tcp` 这类等于没识别，
+  清空后走协议兜底，避免资产表出现"识别成功"的假象。
+
+### 测试
+
+- `svcid/spa_test.go`：SPA 判定、接口白名单（含"不得请求 login/verifyCode/delete"）、
+  `platformName` 抽取、以及一条起本地假服务的端到端用例（壳页 → 按 base 抓 JS → 取接口）。
+- `TestStrictWordAnd` / `TestWordOrDefault`：钉住"内层 and 必须全词命中、默认仍是 or"。
+
+---
+
 ## [1.2.1] - 2026-11-12
 
 ### 修复

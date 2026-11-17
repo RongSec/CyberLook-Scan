@@ -26,7 +26,7 @@ import (
 	"github.com/RongSec/CyberLook-Scan/svcid"
 )
 
-const version = "1.5.0"
+const version = "1.5.1"
 
 const banner = `
    ____                          __  __
@@ -65,6 +65,8 @@ const usage = `用法:
   -rules string        FingerprintHub 规则路径，逗号分隔，每项可为目录或 .json 文件
                        （默认 data/fingerprint；文件名含 web_fingerprint/service_fingerprint 决定归属）
   -no-probes           只用被动探针，不发主动探针（等价 Finger=tiny）
+  -deep-spa            空壳 SPA 深度识别（默认 true）：抓同源 JS + 只读配置接口，
+                       从接口返回里取产品名；关掉可省掉每个 SPA 端口 1~6 秒
 
 输出:
   -out string          结果 JSON 输出路径
@@ -158,6 +160,7 @@ func main() {
 	doIdent := flag.Bool("identify", false, "扫描后做服务识别")
 	rulesDir := flag.String("rules", "data/fingerprint", "规则路径：逗号分隔的目录或 .json 文件")
 	noProbes := flag.Bool("no-probes", false, "不做主动探针")
+	deepSPA := flag.Bool("deep-spa", true, "空壳 SPA 深度识别：抓同源 JS 与只读配置接口（默认开）")
 	outPath := flag.String("out", "", "结果 JSON 输出路径")
 	quiet := flag.Bool("quiet", false, "只输出汇总")
 	reident := flag.String("reidentify", "", "只重跑识别")
@@ -187,7 +190,7 @@ func main() {
 
 	// ===== 只重跑识别 =====
 	if *reident != "" {
-		runReidentify(*reident, *rulesDir, *outPath, *conc, *quiet)
+		runReidentify(*reident, *rulesDir, *outPath, *conc, *quiet, *deepSPA)
 		return
 	}
 
@@ -402,7 +405,7 @@ func main() {
 			go func(ip string, port int) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				sv := svcid.Identify(ctx, ip, port, svcid.IdentOptions{Rules: rs, Probes: probes})
+				sv := svcid.Identify(ctx, ip, port, svcid.IdentOptions{Rules: rs, Probes: probes, DeepSPA: *deepSPA})
 				mu.Lock()
 				out.Services = append(out.Services, sv)
 				out.ProtoStat[sv.Protocol]++
@@ -446,7 +449,7 @@ func main() {
 	}
 }
 
-func runReidentify(src, rulesDir, outPath string, conc int, quiet bool) {
+func runReidentify(src, rulesDir, outPath string, conc int, quiet bool, deepSPA bool) {
 	fmt.Print(banner)
 	b, err := os.ReadFile(src)
 	if err != nil {
@@ -490,7 +493,7 @@ func runReidentify(src, rulesDir, outPath string, conc int, quiet bool) {
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			sv := svcid.Identify(ctx, ip, port, svcid.IdentOptions{Rules: rs, Probes: probes})
+			sv := svcid.Identify(ctx, ip, port, svcid.IdentOptions{Rules: rs, Probes: probes, DeepSPA: deepSPA})
 			mu.Lock()
 			out.Services = append(out.Services, sv)
 			out.ProtoStat[sv.Protocol]++

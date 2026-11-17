@@ -1,0 +1,101 @@
+[
+  {
+    "id": "sangfor-llm-guardrail",
+    "info": {
+      "name": "深信服-大模型安全护栏",
+      "author": "cyberlook-local",
+      "tags": "detect,tech,llm,guardrail,sangfor",
+      "severity": "info",
+      "metadata": {
+        "product": "深信服 大模型安全护栏",
+        "vendor": "Sangfor",
+        "verified": true,
+        "note": "登录页为空壳 SPA，产品名只在 /api/apex/portal/v1/loginPage 的 customize.platformName 里；靠 -deep-spa 抓接口后才可能命中"
+      }
+    },
+    "http": [
+      {
+        "method": "GET",
+        "path": [
+          "{{BaseURL}}/"
+        ],
+        "matchers": [
+          {
+            "type": "word",
+            "words": [
+              "大模型安全护栏"
+            ],
+            "condition": "or"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "sangfor-apex-portal",
+    "info": {
+      "name": "深信服-统一门户(APEX)",
+      "author": "cyberlook-local",
+      "tags": "detect,tech,sangfor,portal",
+      "severity": "info",
+      "metadata": {
+        "product": "深信服 统一门户",
+        "vendor": "Sangfor",
+        "verified": true,
+        "note": "APEX 是深信服全线的 Web 框架；单独的 apex-base/portal/login 会被其他厂商复用，必须叠加 ngsoc 接口路径或版权文案才算"
+      }
+    },
+    "http": [
+      {
+        "method": "GET",
+        "path": [
+          "{{BaseURL}}/"
+        ],
+        "matchers": [
+          {
+            "type": "word",
+            "words": [
+              "apex-base/portal/login",
+              "ngsoc/auth/api"
+            ],
+            "condition": "and",
+            "case-insensitive": true
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "ami-megarac-bmc",
+    "info": {
+      "name": "AMI-MegaRAC BMC",
+      "author": "cyberlook-local",
+      "tags": "detect,tech,bmc,ami",
+      "severity": "info",
+      "metadata": {
+        "product": "AMI MegaRAC BMC(服务器带外管理)",
+        "vendor": "American Megatrends",
+        "verified": true,
+        "note": "带外管理口只有自签证书能当特征：O=AMI / OU=MEGARAC / CN=ami.com；页面是 gzip 后的空壳"
+      }
+    },
+    "http": [
+      {
+        "method": "GET",
+        "path": [
+          "{{BaseURL}}/"
+        ],
+        "matchers": [
+          {
+            "type": "word",
+            "words": [
+              "megarac"
+            ],
+            "condition": "or",
+            "case-insensitive": true
+          }
+        ]
+      }
+    ]
+  }
+]

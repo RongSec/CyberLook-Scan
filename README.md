@@ -124,8 +124,9 @@
 ② Windows 握手    445/139/3389/135 及动态 RPC 端口，取真实 OS 与主机名
 ③ HTTP 抓页       GET 首页 + favicon；容忍 3xx/4xx/自签证书；记录标题、状态码、正文长度
 ④ 规则匹配        web 3,450 条（word/regex/favicon）+ service 11,938 条，Aho-Corasick 一次过
-⑤ 主动探针        按端口发对应载荷，每端口 ≤3 组
-⑥ 端口兜底        以上全空但有协议线索时，用协议名占位
+⑤ SPA 取证        空壳页面：抓同源 JS + 只读配置接口，取回产品名（见 4.1）
+⑥ 主动探针        按端口发对应载荷，每端口 ≤3 组
+⑦ 端口兜底        以上全空但有协议线索时，用协议名占位
 ```
 
 几处刻意的克制：
@@ -133,9 +134,76 @@
 - **单一弱词命中不产品化**：`score < 15` 的命中不并入技术栈，否则一个页面能报出四个产品；
 - **技术栈最多并列 3 个**，顺序即置信度；
 - **重定向手动跟随**：上一跳的响应也是证据（`Server` 头常在 302 上）；
-- **TLS 证书 CN/O 参与识别**：内网自签证书经常直接写单位名/系统名，信噪比很高。
+- **TLS 证书 CN/O/OU 参与识别**：内网自签证书经常直接写单位名/系统名，信噪比很高
+  （BMC 类设备的产品线只在 OU 里，例如 `O=AMI + OU=MEGARAC + CN=ami.com`）；
+- **matcher 内的 `condition` 必须尊重**：一个 word matcher 列出多个词且标 `and` 时，
+  这些词要**全部出现**才叫命中。这条看着像细节，实测代价很大 —— 见 4.2。
 
 识别层任何异常都被 `safeIdentify` 兜底为裸 `tcp` 结果 —— 识别失败不能拖垮扫描。
+
+### 4.1 空壳 SPA：浏览器能看到，抓 HTML 看不到
+
+管理台、网关、审计系统这一类目标，首页往往只是一个壳：
+
+```html
+<html><head><base href="/static/"><title></title></head>
+<body><div id="app"></div>
+<script src="./apex-base/portal/login/js/bootstrap.js"></script></body></html>
+```
+
+1,136 字节，标题空，产品名由 JS 在运行时向后端取回再写进 DOM。这类目标上，
+纯静态匹配只有两种结局：**识别不出来**，或者**被页面里残留的通用词误判**。
+
+`-deep-spa`（默认开）补的就是这一段，触发条件很窄——正文 < 32KB、有外链脚本、
+且同时满足"有 `id=app/root/__next/__nuxt` 挂载点"或"标题为空"：
+
+| 步骤 | 做法 | 关键细节 |
+|---|---|---|
+| 定位 JS | 解析 `<base href>` 后拼 `<script src>` | 相对路径的基准常常是 `/static/` 而不是站点根，直接按根拼会拿到 401 |
+| 抓 JS | 同源、最多 2 个、单文件 ≤1MB，入口包优先 | `vendor`/`chunk-vendors` 排最后，产品名不在框架里 |
+| 抽接口 | 从 JS 字符串字面量里取 `"/api/..."` | 只认含 `api`/`rest` 且命中信息类关键词的路径 |
+| 取身份 | GET 只读接口，抽 `platformName` / `platformIntroduction` / 版权 | 白名单字段；`login`/`captcha`/`verifyCode`/`delete`/`update` 等一律不碰 |
+| 二次匹配 | 接口字段拼成补语料，再跑一次规则 | 拿到的名字比页面残留词可靠得多 |
+
+实测（`10.24.9.103:443`，深信服大模型安全护栏）：
+
+```
+GET /                                    → 200, 1136B, <title></title>
+GET /static/apex-base/portal/login/js/bootstrap.a03541d2.js  → 200, 602KB
+GET /api/apex/portal/v1/loginPage        → 200 JSON
+    customize.platformName        = "大模型安全护栏"
+    customize.platformIntroduction= "深信服大模型安全护栏，基于大小模型混合架构…"
+判定：深信服 大模型安全护栏（source=spa-rule）
+```
+
+开销可控：只有空壳 SPA 才触发，每个端口总预算 6 秒；整段 C 类网段（254 目标 ×
+100 端口）识别总耗时从 10.24s 变到 10.25s。
+
+### 4.2 词间 `and`：误报的主要来源
+
+FingerprintHub 里 3,450 条 web 规则中，有 **422 条**把条件写在 matcher 内部：
+
+```json
+{"type":"word","words":["login","loid_regist()"],"condition":"and"}
+```
+
+早期实现只认 HTTP item 级的 `matchers-condition`，内层 `condition` 被忽略，于是
+"任一词命中即通过"。上面那条规则的结果是：**只要页面出现 `login` 就报"中国电信
+天翼宽带政企网关"**——`portal/login` 这个路径足以触发，而 `loid_regist()` 压根没出现。
+
+现在的处理：加载规则时把这批 matcher 单独登记，Aho-Corasick 命中后再做一次全词校验
+（语言是确定的几百个短串，`strings.Contains` 逐条验，开销可忽略）。
+
+同一网段修正前后的差异（`10.24.9.0/24`，top100）：
+
+| 目标 | 修正前 | 修正后 | 事实 |
+|---|---|---|---|
+| `10.24.9.102/103:443` | 中国电信 天翼宽带政企网关 | 深信服 大模型安全护栏 | 配置接口自述 |
+| `10.24.9.121/127:443` | 安恒云堡垒机 | 安恒信息 明御数据库审计与风险控制系统 | 页面标题自述 |
+| `10.24.9.104:443` | IBM HTTP Server | AMI MegaRAC BMC | 证书 `O=AMI/OU=MEGARAC` |
+| `10.24.9.102/103:8443` | cachethq | Sangfor Platform | 证书 `CN=Sangfor Platform` |
+
+识别覆盖率不变（91% → 91%），变化的是**报出来的名字变对了**。
 
 ---
 
