@@ -33,6 +33,12 @@ type Service struct {
 	Body         string `json:"body,omitempty"`         // HTTP 响应体（算页面 SimHash 用）
 	OS           string `json:"os,omitempty"`           // SMB/RDP 握手拿到的 OS
 	Fingerprint  string `json:"fingerprint,omitempty"` // 技术栈（产品+版本，逗号分隔）
+
+	// NeedAI 标记"这条结果需要 AI 复核"。
+	// 判据只看**证据来源**，不看内容长什么样——不在这里用任何正则去猜名字真假
+	// （那会截断 fingerhub 的合法结果，且规则永远追不上新设备）。
+	// 需要人在/模型在的场合：产品名缺失、或只来自弱来源（协议名/证书/HTTP 头/页面标题）。
+	NeedAI bool `json:"needAi,omitempty"`
 }
 
 // IdentOptions 识别参数
@@ -164,13 +170,6 @@ func Identify(ctx context.Context, ip string, port int, opt IdentOptions) Servic
 					}
 				}
 			}
-			// 规则只命中"Web 服务器"这类基础设施，而标题明确指向某个系统时，
-			// 标题才是真正要的信息（实测：Graylog 的页面被报成 nginx，
-			// 因为 Graylog 那条规则要求两个词同时出现，页面上只有一个）。
-			if res.Source == "web-rule" && isInfraProduct(res.Product) && title != "" && !isJunkTitle(title) {
-				res.Product = title
-				res.Source = "http-title"
-			}
 			// 规则给出"通用 HTTP 服务"这类等于没说的产品名时，标题里的信息更多
 			// （实测：IBM Storwize V7000 的登录页被某条通用规则报成 Generic HTTP Server）
 			if res.Source == "web-rule" && isGenericProduct(res.Product) && title != "" && !isJunkTitle(title) {
@@ -286,6 +285,16 @@ func Identify(ctx context.Context, ip string, port int, opt IdentOptions) Servic
 	res.Fingerprint = res.Product
 	if res.Version != "" {
 		res.Fingerprint = res.Product + "/" + res.Version
+	}
+	// 需要 AI 复核的情形（按来源枚举，不按内容正则）：
+	//   产品名为空            → 什么都没认出来
+	//   port-hint             → 只知道协议名（"HTTP"/"SSH"），不知道是什么系统
+	//   tls-cert              → 证书里的名字（常是厂商或单位名，不是产品）
+	//   http-version          → 只知道 Web 服务器版本（nginx/1.24）
+	//   http-title            → 页面标题（可能只是"Login"，也可能是真实系统名）
+	switch res.Source {
+	case "", "port-hint", "tls-cert", "http-version", "http-title":
+		res.NeedAI = true
 	}
 	return res
 }
@@ -556,22 +565,4 @@ func isGenericProduct(p string) bool {
 		return true
 	}
 	return false
-}
-
-// isInfraProduct 判断产品名是否只表示"这是个 Web 服务器"（不含业务系统信息）。
-// 这类名字在资产台账里几乎没有价值——知道是 nginx 并不能告诉人这台机器干什么。
-func isInfraProduct(p string) bool {
-	parts := strings.Split(p, ",")
-	for _, one := range parts {
-		x := strings.ToLower(strings.TrimSpace(one))
-		x = strings.SplitN(x, "/", 2)[0]
-		switch x {
-		case "nginx", "apache", "apache httpd", "httpd", "iis", "microsoft-iis",
-			"openresty", "tengine", "lighttpd", "caddy", "http", "https",
-			"generic http server", "apache-coyote", "tomcat":
-		default:
-			return false
-		}
-	}
-	return true
 }
